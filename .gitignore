@@ -1,0 +1,8 @@
+.bundle
+test_*.rb
+test_*.json
+*.log
+.bundle
+vendor/bundle
+.env
+k8s
