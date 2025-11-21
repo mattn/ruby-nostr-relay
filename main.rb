@@ -121,7 +121,7 @@ class NostrRelay
         pubkey: ENV['RELAY_PUBKEY'] || "",
         contact: ENV['RELAY_CONTACT'] || "",
         icon: ENV['RELAY_ICON'] || "",
-        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 62],
+        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 62, 70],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
@@ -184,11 +184,11 @@ class NostrRelay
               when "EVENT"
                 event = args[0]
                 # Broadcast event and send OK response (NIP-20)
-                success = broadcast_event(event)
+                success, message = broadcast_event(event)
                 if success
                   connection.write(["OK", event["id"], true, ""].to_json)
                 else
-                  connection.write(["OK", event["id"], false, "rejected: invalid event"].to_json)
+                  connection.write(["OK", event["id"], false, message || "rejected: invalid event"].to_json)
                 end
                 connection.flush
               when "REQ"
@@ -266,7 +266,16 @@ class NostrRelay
     # Verify event signature (ID verification only - catches malformed events)
     valid = verify_event(event)
     unless valid
-      return false
+      return [false, "invalid: event signature verification failed"]
+    end
+    
+    # NIP-70: Reject protected events (events with "-" tag)
+    # Protected events can only be published by the author after AUTH
+    # Since we don't implement AUTH yet, reject all protected events
+    protected_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "-" }
+    if protected_tag
+      # Reject protected events
+      return [false, "auth-required: this event may only be published by its author"]
     end
     
     # NIP-40: Filter out expired events
@@ -275,7 +284,7 @@ class NostrRelay
       expiration_time = expiration_tag[1].to_i
       if Time.now.to_i >= expiration_time
         # Event has expired, don't broadcast or save
-        return false
+        return [false, "invalid: event has expired"]
       end
     end
     
@@ -312,7 +321,7 @@ class NostrRelay
         )
       end
       # Don't broadcast vanish requests
-      return true
+      return [true, ""]
     end
     
     # Prevent re-broadcasting vanished events
@@ -320,7 +329,7 @@ class NostrRelay
       vanish_time = @@vanished_pubkeys[event["pubkey"]]
       if vanish_time && event["created_at"] <= vanish_time
         # Reject events from vanished pubkeys created before vanish request
-        return false
+        return [false, "blocked: author has requested to vanish"]
       end
     end
 
@@ -335,7 +344,7 @@ class NostrRelay
         end
       end
       # Don't save or broadcast the deletion event itself
-      return true
+      return [true, ""]
     end
     
     # Handle ephemeral events (kind 20000-29999) - NIP-16
@@ -356,7 +365,7 @@ class NostrRelay
           end
         end
       end
-      return true
+      return [true, ""]
     end
 
     # Save to database if connected
@@ -364,7 +373,7 @@ class NostrRelay
       begin
         # Skip if event already exists
         if DB[:event][:id => event["id"]]
-          return true
+          return [true, ""]
         end
         
         # Handle replaceable events (kind 0, 3, 10000-19999)
@@ -377,7 +386,7 @@ class NostrRelay
               DB[:event].where(kind: kind, pubkey: event["pubkey"]).delete
             else
               # Reject older event
-              return false
+              return [false, "duplicate: newer event already exists"]
             end
           end
         elsif kind >= 30000 && kind < 40000
@@ -395,7 +404,7 @@ class NostrRelay
               DB[:event].where(id: existing[:id]).delete
             else
               # Reject older event
-              return false
+              return [false, "duplicate: newer event already exists"]
             end
           end
         end
@@ -433,7 +442,7 @@ class NostrRelay
     end
     
     # Return success
-    true
+    [true, ""]
   end
 
   def send_history(conn, sub_id, filters)
