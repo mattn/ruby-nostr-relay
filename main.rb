@@ -5,15 +5,24 @@
 $stdout.sync = true
 $stderr.sync = true
 
-puts "Starting Ruby Nostr Relay..."
-puts "Ruby version: #{RUBY_VERSION}"
+require 'logger'
+
+# Initialize logger
+LOGGER = Logger.new($stdout)
+LOGGER.level = Logger::INFO
+LOGGER.formatter = proc do |severity, datetime, progname, msg|
+  "#{datetime.strftime('%Y-%m-%d %H:%M:%S')} [#{severity}] #{msg}\n"
+end
+
+LOGGER.info "Starting Ruby Nostr Relay..."
+LOGGER.info "Ruby version: #{RUBY_VERSION}"
 
 # Suppress IO::Buffer warning from async-websocket
 $VERBOSE = nil
 
 require 'bundler/setup'
 
-puts "Loading dependencies..."
+LOGGER.info "Loading dependencies..."
 
 require 'async'
 require 'async/websocket/response'
@@ -26,17 +35,17 @@ require 'json'
 require 'digest'
 require 'schnorr'
 
-puts "Dependencies loaded successfully"
+LOGGER.info "Dependencies loaded successfully"
 
 # PostgreSQL Database Setup
-puts "Initializing database connection..."
+LOGGER.info "Initializing database connection..."
 begin
   db_url = ENV['DATABASE_URL']
   if db_url && !db_url.empty?
     DB = Sequel.connect(db_url)
     DB.extension :pg_json
     
-    puts "Connected to database: custom"
+    LOGGER.info "Connected to database: custom"
     
     # Create tags_to_tagvalues function if not exists
     DB.run <<~SQL
@@ -47,11 +56,11 @@ begin
       RETURNS NULL ON NULL INPUT;
     SQL
     
-    puts "Database function tags_to_tagvalues created/verified"
+    LOGGER.info "Database function tags_to_tagvalues created/verified"
     
     # Create event table if not exists
     unless DB.table_exists?(:event)
-      puts "Creating event table..."
+      LOGGER.info "Creating event table..."
       DB.run <<~SQL
         CREATE TABLE event (
           id text NOT NULL,
@@ -65,7 +74,7 @@ begin
         );
       SQL
       
-      puts "Creating indexes..."
+      LOGGER.info "Creating indexes..."
       # Create indexes
       DB.run "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event USING btree (id text_pattern_ops);"
       DB.run "CREATE INDEX IF NOT EXISTS pubkeyprefix ON event USING btree (pubkey text_pattern_ops);"
@@ -74,14 +83,14 @@ begin
       DB.run "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind, created_at DESC);"
       DB.run "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);"
       
-      puts "Database table and indexes created successfully"
+      LOGGER.info "Database table and indexes created successfully"
     else
-      puts "Database table 'event' already exists"
+      LOGGER.info "Database table 'event' already exists"
     end
     
-    puts "Database setup completed successfully"
+    LOGGER.info "Database setup completed successfully"
   else
-    puts "No DATABASE_URL provided, starting without database support"
+    LOGGER.info "No DATABASE_URL provided, starting without database support"
     DB = nil
   end
 rescue => e
@@ -168,6 +177,7 @@ class NostrRelay
             
             begin
               cmd, *args = JSON.parse(message)
+              LOGGER.info "Received: #{message}"
               case cmd
               when "EVENT"
                 event = args[0]
@@ -515,7 +525,7 @@ if $0 == __FILE__
   middleware = NostrRelay.new
   endpoint = Async::HTTP::Endpoint.parse("http://0.0.0.0:8080")
 
-  puts "Nostr Relay starting on ws://localhost:8080"
+  LOGGER.info "Nostr Relay starting on ws://localhost:8080"
   
   Async do
     server = Falcon::Server.new(middleware, endpoint)
