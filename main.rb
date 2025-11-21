@@ -171,9 +171,7 @@ class NostrRelay
 
         begin
           loop do
-            frame = connection.read_frame
-            break unless frame
-            message = frame.unpack
+            message = connection.read
             break unless message
             
             begin
@@ -202,8 +200,8 @@ class NostrRelay
               connection.flush rescue nil
             end
           end
-        rescue EOFError, Errno::EPIPE, Errno::ECONNRESET
-          # Client closed connection (normal or abrupt)
+        rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, Protocol::WebSocket::ProtocolError
+          # Client closed connection (normal or abrupt) or protocol error
         end
       ensure
         # Remove this connection from global list
