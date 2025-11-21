@@ -174,9 +174,12 @@ class NostrRelay
             message = connection.read
             break unless message
             
+            # Extract text content from message object
+            text = message.respond_to?(:read) ? message.read : message.to_s
+            
             begin
-              cmd, *args = JSON.parse(message)
-              LOGGER.info "Received: #{message}"
+              cmd, *args = JSON.parse(text)
+              LOGGER.info "Received: #{text}"
               case cmd
               when "EVENT"
                 event = args[0]
