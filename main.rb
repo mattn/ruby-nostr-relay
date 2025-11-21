@@ -120,6 +120,7 @@ class NostrRelay
         description: ENV['RELAY_DESCRIPTION'] || "A lightweight Nostr relay implementation in Ruby",
         pubkey: ENV['RELAY_PUBKEY'] || "",
         contact: ENV['RELAY_CONTACT'] || "",
+        icon: ENV['RELAY_ICON'] || "",
         supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 62],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
