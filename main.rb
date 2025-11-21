@@ -146,8 +146,8 @@ class NostrRelay
       
       begin
       
-        connection.write(["NOTICE", "Nostr Relay - Connected"].to_json)
-        connection.flush
+        #connection.write(["NOTICE", "Nostr Relay - Connected"].to_json)
+        #connection.flush
 
         begin
           loop do
@@ -160,7 +160,15 @@ class NostrRelay
               cmd, *args = JSON.parse(message)
               case cmd
               when "EVENT"
-                broadcast_event(args[0])
+                event = args[0]
+                # Broadcast event and send OK response (NIP-20)
+                success = broadcast_event(event)
+                if success
+                  connection.write(["OK", event["id"], true, ""].to_json)
+                else
+                  connection.write(["OK", event["id"], false, "rejected: invalid event"].to_json)
+                end
+                connection.flush
               when "REQ"
                 client[:subscriptions][args[0]] = args[1..-1]
                 send_history(connection, args[0], args[1..-1])
@@ -236,7 +244,7 @@ class NostrRelay
     # Verify event signature (ID verification only - catches malformed events)
     valid = verify_event(event)
     unless valid
-      return
+      return false
     end
     
     # NIP-40: Filter out expired events
@@ -245,7 +253,7 @@ class NostrRelay
       expiration_time = expiration_tag[1].to_i
       if Time.now.to_i >= expiration_time
         # Event has expired, don't broadcast or save
-        return
+        return false
       end
     end
     
@@ -282,7 +290,7 @@ class NostrRelay
         )
       end
       # Don't broadcast vanish requests
-      return
+      return true
     end
     
     # Prevent re-broadcasting vanished events
@@ -290,7 +298,7 @@ class NostrRelay
       vanish_time = @@vanished_pubkeys[event["pubkey"]]
       if vanish_time && event["created_at"] <= vanish_time
         # Reject events from vanished pubkeys created before vanish request
-        return
+        return false
       end
     end
 
@@ -305,7 +313,7 @@ class NostrRelay
         end
       end
       # Don't save or broadcast the deletion event itself
-      return
+      return true
     end
     
     # Handle ephemeral events (kind 20000-29999) - NIP-16
@@ -326,13 +334,16 @@ class NostrRelay
           end
         end
       end
-      return
+      return true
     end
 
     # Save to database if connected
     if DB
       begin
-        return if DB[:event][:id => event["id"]]
+        # Skip if event already exists
+        if DB[:event][:id => event["id"]]
+          return true
+        end
         
         # Handle replaceable events (kind 0, 3, 10000-19999)
         if kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
@@ -344,7 +355,7 @@ class NostrRelay
               DB[:event].where(kind: kind, pubkey: event["pubkey"]).delete
             else
               # Reject older event
-              return
+              return false
             end
           end
         elsif kind >= 30000 && kind < 40000
@@ -362,7 +373,7 @@ class NostrRelay
               DB[:event].where(id: existing[:id]).delete
             else
               # Reject older event
-              return
+              return false
             end
           end
         end
@@ -398,6 +409,9 @@ class NostrRelay
         end
       end
     end
+    
+    # Return success
+    true
   end
 
   def send_history(conn, sub_id, filters)
