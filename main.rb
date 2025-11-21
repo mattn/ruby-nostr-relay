@@ -140,7 +140,12 @@ class NostrRelay
       }
       
       return Protocol::HTTP::Response[200, 
-        {'content-type' => 'application/json'}, 
+        {
+          'content-type' => 'application/json',
+          'access-control-allow-origin' => '*',
+          'access-control-allow-headers' => 'Content-Type, Accept',
+          'access-control-allow-methods' => 'GET'
+        }, 
         [relay_info.to_json]]
     end
     
