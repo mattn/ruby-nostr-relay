@@ -1,10 +1,15 @@
 #!/usr/bin/env ruby
 # Nostr Relay for Ruby 3.0
 
+puts "Starting Ruby Nostr Relay..."
+puts "Ruby version: #{RUBY_VERSION}"
+
 # Suppress IO::Buffer warning from async-websocket
 $VERBOSE = nil
 
 require 'bundler/setup'
+
+puts "Loading dependencies..."
 
 require 'async'
 require 'async/websocket/response'
@@ -17,10 +22,15 @@ require 'json'
 require 'digest'
 require 'schnorr'
 
+puts "Dependencies loaded successfully"
+
 # PostgreSQL Database Setup
+puts "Initializing database connection..."
 begin
   DB = Sequel.connect(ENV['DATABASE_URL'] || 'postgres://localhost/ruby-nostr-relay')
   DB.extension :pg_json
+  
+  puts "Connected to database: #{ENV['DATABASE_URL'] ? 'custom' : 'default'}"
   
   # Create tags_to_tagvalues function if not exists
   DB.run <<~SQL
@@ -31,8 +41,11 @@ begin
     RETURNS NULL ON NULL INPUT;
   SQL
   
+  puts "Database function tags_to_tagvalues created/verified"
+  
   # Create event table if not exists
   unless DB.table_exists?(:event)
+    puts "Creating event table..."
     DB.run <<~SQL
       CREATE TABLE event (
         id text NOT NULL,
@@ -46,6 +59,7 @@ begin
       );
     SQL
     
+    puts "Creating indexes..."
     # Create indexes
     DB.run "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event USING btree (id text_pattern_ops);"
     DB.run "CREATE INDEX IF NOT EXISTS pubkeyprefix ON event USING btree (pubkey text_pattern_ops);"
@@ -55,9 +69,14 @@ begin
     DB.run "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);"
     
     puts "Database table and indexes created successfully"
+  else
+    puts "Database table 'event' already exists"
   end
+  
+  puts "Database setup completed successfully"
 rescue => e
-  puts "Database connection failed: #{e.message}"
+  puts "Database connection failed: #{e.class} - #{e.message}"
+  puts e.backtrace.first(5).join("\n") if e.backtrace
   puts "Server will start without database support"
   DB = nil
 end
@@ -312,50 +331,56 @@ class NostrRelay
 
     # Save to database if connected
     if DB
-      return if DB[:event][:id => event["id"]]
-      
-      # Handle replaceable events (kind 0, 3, 10000-19999)
-      if kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
-        # Regular replaceable: Replace older events with same kind and pubkey
-        existing = DB[:event].where(kind: kind, pubkey: event["pubkey"]).first
-        if existing
-          # Only replace if new event is newer
-          if event["created_at"] > existing[:created_at]
-            DB[:event].where(kind: kind, pubkey: event["pubkey"]).delete
-          else
-            # Reject older event
-            return
+      begin
+        return if DB[:event][:id => event["id"]]
+        
+        # Handle replaceable events (kind 0, 3, 10000-19999)
+        if kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
+          # Regular replaceable: Replace older events with same kind and pubkey
+          existing = DB[:event].where(kind: kind, pubkey: event["pubkey"]).first
+          if existing
+            # Only replace if new event is newer
+            if event["created_at"] > existing[:created_at]
+              DB[:event].where(kind: kind, pubkey: event["pubkey"]).delete
+            else
+              # Reject older event
+              return
+            end
+          end
+        elsif kind >= 30000 && kind < 40000
+          # Parameterized replaceable: Replace events with same kind, pubkey, and "d" tag
+          d_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "d" }
+          d_value = d_tag&.[](1) || ""
+          
+          existing = DB[:event].where(kind: kind, pubkey: event["pubkey"])
+            .where(Sequel.lit("tags @> ?", Sequel.pg_jsonb([["d", d_value]])))
+            .first
+          
+          if existing
+            # Only replace if new event is newer
+            if event["created_at"] > existing[:created_at]
+              DB[:event].where(id: existing[:id]).delete
+            else
+              # Reject older event
+              return
+            end
           end
         end
-      elsif kind >= 30000 && kind < 40000
-        # Parameterized replaceable: Replace events with same kind, pubkey, and "d" tag
-        d_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "d" }
-        d_value = d_tag&.[](1) || ""
         
-        existing = DB[:event].where(kind: kind, pubkey: event["pubkey"])
-          .where(Sequel.lit("tags @> ?", Sequel.pg_jsonb([["d", d_value]])))
-          .first
-        
-        if existing
-          # Only replace if new event is newer
-          if event["created_at"] > existing[:created_at]
-            DB[:event].where(id: existing[:id]).delete
-          else
-            # Reject older event
-            return
-          end
-        end
+        DB[:event].insert(
+          id: event["id"],
+          pubkey: event["pubkey"],
+          kind: event["kind"],
+          created_at: event["created_at"],
+          tags: Sequel.pg_jsonb(event["tags"]),
+          content: event["content"],
+          sig: event["sig"]
+        )
+      rescue => e
+        puts "Database error while saving event: #{e.class} - #{e.message}"
+        puts e.backtrace.first(3).join("\n") if e.backtrace
+        # Continue to broadcast even if save failed
       end
-      
-      DB[:event].insert(
-        id: event["id"],
-        pubkey: event["pubkey"],
-        kind: event["kind"],
-        created_at: event["created_at"],
-        tags: Sequel.pg_jsonb(event["tags"]),
-        content: event["content"],
-        sig: event["sig"]
-      )
     end
 
     # Broadcast to all connected clients with matching subscriptions
