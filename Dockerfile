@@ -33,7 +33,7 @@ RUN apk add --no-cache \
     gmp \
     tzdata \
     wget \
-    libc6-compat
+    gcompat
 
 WORKDIR /app
 
