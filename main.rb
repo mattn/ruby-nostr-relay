@@ -1,6 +1,10 @@
 #!/usr/bin/env ruby
 # Nostr Relay for Ruby 3.0
 
+# Force immediate stdout/stderr flushing for container logs
+$stdout.sync = true
+$stderr.sync = true
+
 puts "Starting Ruby Nostr Relay..."
 puts "Ruby version: #{RUBY_VERSION}"
 
