@@ -33,7 +33,8 @@ RUN apk add --no-cache \
     gmp \
     tzdata \
     wget \
-    gcompat
+    libc6-compat && \
+    ln -s /lib/libc.so.6 /usr/lib/libresolv.so.2
 
 WORKDIR /app
 
