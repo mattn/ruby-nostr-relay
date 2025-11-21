@@ -175,7 +175,14 @@ class NostrRelay
             break unless message
             
             # Extract text content from message object
-            text = message.respond_to?(:read) ? message.read : message.to_s
+            text = case message
+            when String
+              message
+            when Protocol::WebSocket::TextMessage
+              message.read
+            else
+              message.to_s
+            end
             
             begin
               cmd, *args = JSON.parse(text)
