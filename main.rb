@@ -31,53 +31,59 @@ puts "Dependencies loaded successfully"
 # PostgreSQL Database Setup
 puts "Initializing database connection..."
 begin
-  DB = Sequel.connect(ENV['DATABASE_URL'] || 'postgres://localhost/ruby-nostr-relay')
-  DB.extension :pg_json
-  
-  puts "Connected to database: #{ENV['DATABASE_URL'] ? 'custom' : 'default'}"
-  
-  # Create tags_to_tagvalues function if not exists
-  DB.run <<~SQL
-    CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
-    AS 'SELECT array_agg(t->>1) FROM (SELECT jsonb_array_elements($1) AS t)s WHERE length(t->>0) = 1;'
-    LANGUAGE SQL
-    IMMUTABLE
-    RETURNS NULL ON NULL INPUT;
-  SQL
-  
-  puts "Database function tags_to_tagvalues created/verified"
-  
-  # Create event table if not exists
-  unless DB.table_exists?(:event)
-    puts "Creating event table..."
+  db_url = ENV['DATABASE_URL']
+  if db_url && !db_url.empty?
+    DB = Sequel.connect(db_url)
+    DB.extension :pg_json
+    
+    puts "Connected to database: custom"
+    
+    # Create tags_to_tagvalues function if not exists
     DB.run <<~SQL
-      CREATE TABLE event (
-        id text NOT NULL,
-        pubkey text NOT NULL,
-        created_at integer NOT NULL,
-        kind integer NOT NULL,
-        tags jsonb NOT NULL,
-        content text NOT NULL,
-        sig text NOT NULL,
-        tagvalues text[] GENERATED ALWAYS AS (tags_to_tagvalues(tags)) STORED
-      );
+      CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
+      AS 'SELECT array_agg(t->>1) FROM (SELECT jsonb_array_elements($1) AS t)s WHERE length(t->>0) = 1;'
+      LANGUAGE SQL
+      IMMUTABLE
+      RETURNS NULL ON NULL INPUT;
     SQL
     
-    puts "Creating indexes..."
-    # Create indexes
-    DB.run "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event USING btree (id text_pattern_ops);"
-    DB.run "CREATE INDEX IF NOT EXISTS pubkeyprefix ON event USING btree (pubkey text_pattern_ops);"
-    DB.run "CREATE INDEX IF NOT EXISTS timeidx ON event (created_at DESC);"
-    DB.run "CREATE INDEX IF NOT EXISTS kindidx ON event (kind);"
-    DB.run "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind, created_at DESC);"
-    DB.run "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);"
+    puts "Database function tags_to_tagvalues created/verified"
     
-    puts "Database table and indexes created successfully"
+    # Create event table if not exists
+    unless DB.table_exists?(:event)
+      puts "Creating event table..."
+      DB.run <<~SQL
+        CREATE TABLE event (
+          id text NOT NULL,
+          pubkey text NOT NULL,
+          created_at integer NOT NULL,
+          kind integer NOT NULL,
+          tags jsonb NOT NULL,
+          content text NOT NULL,
+          sig text NOT NULL,
+          tagvalues text[] GENERATED ALWAYS AS (tags_to_tagvalues(tags)) STORED
+        );
+      SQL
+      
+      puts "Creating indexes..."
+      # Create indexes
+      DB.run "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event USING btree (id text_pattern_ops);"
+      DB.run "CREATE INDEX IF NOT EXISTS pubkeyprefix ON event USING btree (pubkey text_pattern_ops);"
+      DB.run "CREATE INDEX IF NOT EXISTS timeidx ON event (created_at DESC);"
+      DB.run "CREATE INDEX IF NOT EXISTS kindidx ON event (kind);"
+      DB.run "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind, created_at DESC);"
+      DB.run "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);"
+      
+      puts "Database table and indexes created successfully"
+    else
+      puts "Database table 'event' already exists"
+    end
+    
+    puts "Database setup completed successfully"
   else
-    puts "Database table 'event' already exists"
+    puts "No DATABASE_URL provided, starting without database support"
+    DB = nil
   end
-  
-  puts "Database setup completed successfully"
 rescue => e
   puts "Database connection failed: #{e.class} - #{e.message}"
   puts e.backtrace.first(5).join("\n") if e.backtrace

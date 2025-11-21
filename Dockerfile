@@ -32,7 +32,8 @@ RUN apk add --no-cache \
     postgresql-libs \
     gmp \
     tzdata \
-    wget
+    wget \
+    libc6-compat
 
 WORKDIR /app
 
