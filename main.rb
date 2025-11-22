@@ -34,6 +34,7 @@ require 'sequel'
 require 'json'
 require 'digest'
 require 'schnorr'
+require 'mini_mime'
 
 LOGGER.info "Dependencies loaded successfully"
 
@@ -154,7 +155,7 @@ class NostrRelay
       return handle_websocket(request)
     end
     
-    Protocol::HTTP::Response[200, {}, ["Nostr Relay - Use WebSocket connection"]]
+    Protocol::HTTP::Response[404, {}, ["Not Found"]]
   rescue => e
     Protocol::HTTP::Response[400, {}, ["Bad request: #{e.message}"]]
   end
@@ -196,6 +197,9 @@ class NostrRelay
                   connection.write(["OK", event["id"], false, message || "rejected: invalid event"].to_json)
                 end
                 connection.flush
+              when "COUNT"
+                client[:subscriptions][args[0]] = args[1..-1]
+                send_history(connection, args[0], args[1..-1])
               when "REQ"
                 client[:subscriptions][args[0]] = args[1..-1]
                 send_history(connection, args[0], args[1..-1])
@@ -450,6 +454,64 @@ class NostrRelay
     [true, ""]
   end
 
+  def send_count(conn, sub_id, filters)
+    unless DB
+      conn.write(["EOSE", sub_id].to_json)
+      conn.flush
+      return
+    end
+    
+    ds = DB[:event].order(Sequel.desc(:created_at))
+
+    # Apply filters
+    filters.each do |f|
+      ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
+      ds = ds.where(pubkey: f['authors']) if f['authors']
+      ds = ds.where(kind: f['kinds']) if f['kinds']
+      ds = ds.where{created_at >= f['since']} if f['since']
+      ds = ds.where{created_at <= f['until']} if f['until']
+      
+      # NIP-12: Generic tag queries (#e, #p, etc)
+      f.each do |key, values|
+        if key.start_with?('#') && values.is_a?(Array)
+          tag_name = key[1..-1]
+          # Use the tagvalues generated column for efficient tag searching
+          ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
+        end
+      end
+      
+      # Use limit from filter if present, otherwise max 500
+      limit = f['limit'] ? [f['limit'], 500].min : 500
+      ds = ds.limit(limit)
+    end
+
+    ds.each do |row|
+      # Convert database row to Nostr event format
+      event = {
+        "id" => row[:id],
+        "pubkey" => row[:pubkey],
+        "created_at" => row[:created_at],
+        "kind" => row[:kind],
+        "tags" => row[:tags],
+        "content" => row[:content],
+        "sig" => row[:sig]
+      }
+      
+      # NIP-40: Skip expired events
+      expiration_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "expiration" }
+      if expiration_tag && expiration_tag[1]
+        expiration_time = expiration_tag[1].to_i
+        next if Time.now.to_i >= expiration_time
+      end
+      
+      conn.write(["EVENT", sub_id, event].to_json)
+      conn.flush
+    end
+
+    conn.write(["EOSE", sub_id].to_json)
+    conn.flush
+  end
+
   def send_history(conn, sub_id, filters)
     unless DB
       conn.write(["EOSE", sub_id].to_json)
@@ -533,18 +595,44 @@ class NostrRelay
   end
 end
 
+class StaticFiles
+  def initialize(app, root: "public")
+    @app = app
+    @root = File.expand_path(root)
+  end
+
+  def call(request)
+    if request.path == "/"
+      request.path = "/index.html"
+    end
+    path = File.expand_path(File.join(@root, request.path))
+
+    return @app.call(request) unless path.start_with?(@root)
+    if File.file?(path)
+      headers = {
+        "content-length" => File.size(path).to_s,
+        "content-type" => MiniMime.lookup_by_filename(path).content_type,
+      }
+      return Protocol::HTTP::Response[200, headers, File.open(path, "rb")]
+    end
+
+    @app.call(request)
+  end
+end
+
 # Server startup
 if $0 == __FILE__
   require 'falcon/server'
   require 'async/reactor'
 
   middleware = NostrRelay.new
+  static_files = StaticFiles.new(middleware, root: "public")
   endpoint = Async::HTTP::Endpoint.parse("http://0.0.0.0:8080")
 
   LOGGER.info "Nostr Relay starting on ws://localhost:8080"
   
   Async do
-    server = Falcon::Server.new(middleware, endpoint)
+    server = Falcon::Server.new(static_files, endpoint)
     server.run
   end
 end
