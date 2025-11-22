@@ -49,7 +49,6 @@ RUN bundle config set --local path 'vendor/bundle'
 
 # Copy application code
 COPY main.rb ./
-COPY public/ ./public/
 
 # Expose WebSocket port
 EXPOSE 8080
@@ -70,6 +69,9 @@ RUN addgroup -g 1000 nostr && \
     chown -R nostr:nostr /app
 
 USER nostr
+
+# Copy public files after user setup to ensure fresh layer
+COPY --chown=nostr:nostr public/ ./public/
 
 # Run the relay
 CMD ["bundle", "exec", "ruby", "main.rb"]
