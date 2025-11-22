@@ -49,6 +49,7 @@ RUN bundle config set --local path 'vendor/bundle'
 
 # Copy application code
 COPY main.rb ./
+COPY public/ ./
 
 # Expose WebSocket port
 EXPOSE 8080
