@@ -8,3 +8,4 @@ test_*.json
 vendor/bundle
 .env
 k8s
+kustomize
