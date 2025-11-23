@@ -122,7 +122,7 @@ class NostrRelay
         pubkey: ENV['RELAY_PUBKEY'] || "",
         contact: ENV['RELAY_CONTACT'] || "",
         icon: ENV['RELAY_ICON'] || "",
-        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 62, 70],
+        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 50, 62, 70],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
@@ -454,6 +454,10 @@ class NostrRelay
     [true, ""]
   end
 
+  def escape_like(s)
+    s.gsub(/[_%\\]/, '']/, '\\\\\\0')
+  end
+
   def send_count(conn, sub_id, filters)
     unless DB
       conn.write(["EOSE", sub_id].to_json)
@@ -470,6 +474,7 @@ class NostrRelay
       ds = ds.where(kind: f['kinds']) if f['kinds']
       ds = ds.where{created_at >= f['since']} if f['since']
       ds = ds.where{created_at <= f['until']} if f['until']
+      ds = ds.where{content.ilike  "%#{escape_like(f['search']}%")} if f['search'] # NIP-15 content filter
       
       # NIP-12: Generic tag queries (#e, #p, etc)
       f.each do |key, values|
