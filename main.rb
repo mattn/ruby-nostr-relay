@@ -602,6 +602,10 @@ class StaticFiles
   end
 
   def call(request)
+    if request.respond_to?(:protocol) && request.protocol&.include?('websocket')
+      return @app.call(request)
+    end
+
     if request.path == "/"
       request.path = "/index.html"
     end
