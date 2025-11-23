@@ -454,7 +454,7 @@ class NostrRelay
     [true, ""]
   end
 
-  def escape_like(s)
+  def escape_like(keywords)
     '%' + keywords
       .gsub(/[_%\\]/) { |m| "\\#{m}" }
       .split
@@ -477,7 +477,7 @@ class NostrRelay
       ds = ds.where(kind: f['kinds']) if f['kinds']
       ds = ds.where{created_at >= f['since']} if f['since']
       ds = ds.where{created_at <= f['until']} if f['until']
-      ds = ds.where{content.ilike "%#{escape_like(f['search'])}%"} if f['search'] # NIP-15 content filter
+      ds = ds.where{content.ilike "%#{escape_like(f['search'])}%"} if f['search']
       
       # NIP-12: Generic tag queries (#e, #p, etc)
       f.each do |key, values|
