@@ -479,7 +479,7 @@ class NostrRelay
       ds = ds.where{created_at <= f['until']} if f['until']
       if f['search']
         s = escape_like(f['search'])
-        ds = ds.where{Sequel.like(:content, "#{s}")} if f['search']
+        ds = ds.where{Sequel.like(:content, s)}
       end
       
       # NIP-12: Generic tag queries (#e, #p, etc)
@@ -541,7 +541,7 @@ class NostrRelay
       ds = ds.where{created_at <= f['until']} if f['until']
       if f['search']
         s = escape_like(f['search'])
-        ds = ds.where{Sequel.like(:content, "#{s}")} if f['search']
+        ds = ds.where{Sequel.like(:content, s)}
       end
       
       # NIP-12: Generic tag queries (#e, #p, etc)
