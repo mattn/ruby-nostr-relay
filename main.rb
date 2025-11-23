@@ -477,6 +477,7 @@ class NostrRelay
       ds = ds.where(kind: f['kinds']) if f['kinds']
       ds = ds.where{created_at >= f['since']} if f['since']
       ds = ds.where{created_at <= f['until']} if f['until']
+      LOGGER.info escape_like(f['search'])
       ds = ds.where{Sequel.like(:content, escape_like(f['search']))} if f['search']
       
       # NIP-12: Generic tag queries (#e, #p, etc)
