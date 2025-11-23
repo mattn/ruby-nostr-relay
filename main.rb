@@ -619,8 +619,6 @@ class StaticFiles
       }
       return Protocol::HTTP::Response[200, headers, File.open(path, "rb")]
     end
-
-    @app.call(request)
   end
 end
 
