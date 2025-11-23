@@ -455,7 +455,10 @@ class NostrRelay
   end
 
   def escape_like(s)
-    s.gsub(/[_%\\]/, '']/, '\\\\\\0')
+    '%' + keywords
+      .gsub(/[_%\\]/) { |m| "\\#{m}" }
+      .split
+      .join('%') + '%'
   end
 
   def send_count(conn, sub_id, filters)
