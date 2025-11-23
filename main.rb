@@ -619,6 +619,8 @@ class StaticFiles
       }
       return Protocol::HTTP::Response[200, headers, File.open(path, "rb")]
     end
+
+    Protocol::HTTP::Response[404, {}, ["Not Found"]]
   end
 end
 
