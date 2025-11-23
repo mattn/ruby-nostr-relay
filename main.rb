@@ -474,7 +474,7 @@ class NostrRelay
       ds = ds.where(kind: f['kinds']) if f['kinds']
       ds = ds.where{created_at >= f['since']} if f['since']
       ds = ds.where{created_at <= f['until']} if f['until']
-      ds = ds.where{content.ilike "%#{escape_like(f['search']}%"} if f['search'] # NIP-15 content filter
+      ds = ds.where{content.ilike "%#{escape_like(f['search'])}%"} if f['search'] # NIP-15 content filter
       
       # NIP-12: Generic tag queries (#e, #p, etc)
       f.each do |key, values|
