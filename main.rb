@@ -45,9 +45,9 @@ begin
   if db_url && !db_url.empty?
     DB = Sequel.connect(db_url)
     DB.extension :pg_json
-    
+
     LOGGER.info "Connected to database: custom"
-    
+
     # Create tags_to_tagvalues function if not exists
     DB.run <<~SQL
       CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
@@ -56,9 +56,9 @@ begin
       IMMUTABLE
       RETURNS NULL ON NULL INPUT;
     SQL
-    
+
     LOGGER.info "Database function tags_to_tagvalues created/verified"
-    
+
     # Create event table if not exists
     unless DB.table_exists?(:event)
       LOGGER.info "Creating event table..."
@@ -74,7 +74,7 @@ begin
           tagvalues text[] GENERATED ALWAYS AS (tags_to_tagvalues(tags)) STORED
         );
       SQL
-      
+
       LOGGER.info "Creating indexes..."
       # Create indexes
       DB.run "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event USING btree (id text_pattern_ops);"
@@ -83,12 +83,12 @@ begin
       DB.run "CREATE INDEX IF NOT EXISTS kindidx ON event (kind);"
       DB.run "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind, created_at DESC);"
       DB.run "CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);"
-      
+
       LOGGER.info "Database table and indexes created successfully"
     else
       LOGGER.info "Database table 'event' already exists"
     end
-    
+
     LOGGER.info "Database setup completed successfully"
   else
     LOGGER.info "No DATABASE_URL provided, starting without database support"
@@ -106,72 +106,34 @@ class NostrRelay
   # Global connection management for broadcasting
   @@connections = []
   @@connections_mutex = Mutex.new
-  
+
   # Track vanished pubkeys to prevent re-broadcasting
   @@vanished_pubkeys = {}
   @@vanished_mutex = Mutex.new
-  
+
   def call(request)
-    # NIP-11: Relay Information Document
-    # Return JSON metadata for HTTP GET requests with Accept: application/nostr+json
-    if request.method == "GET" && 
-       request.headers['accept']&.include?('application/nostr+json')
-      relay_info = {
-        name: ENV['RELAY_NAME'] || "Ruby Nostr Relay",
-        description: ENV['RELAY_DESCRIPTION'] || "A lightweight Nostr relay implementation in Ruby",
-        pubkey: ENV['RELAY_PUBKEY'] || "",
-        contact: ENV['RELAY_CONTACT'] || "",
-        icon: ENV['RELAY_ICON'] || "",
-        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 50, 62, 70],
-        software: "https://github.com/mattn/ruby-nostr-relay",
-        version: "1.0.0",
-        limitation: {
-          max_message_length: 65536,
-          max_subscriptions: 20,
-          max_filters: 10,
-          max_limit: 500,
-          max_subid_length: 100,
-          min_prefix: 4,
-          max_event_tags: 2000,
-          max_content_length: 65536,
-          min_pow_difficulty: 0,
-          auth_required: false,
-          payment_required: false
-        }
-      }
-      
-      return Protocol::HTTP::Response[200, 
-        {
-          'content-type' => 'application/json',
-          'access-control-allow-origin' => '*',
-          'access-control-allow-headers' => 'Content-Type, Accept',
-          'access-control-allow-methods' => 'GET'
-        }, 
-        [relay_info.to_json]]
-    end
-    
     # Check for WebSocket connection
     if request.respond_to?(:protocol) && request.protocol&.include?('websocket')
       return handle_websocket(request)
     end
-    
+
     Protocol::HTTP::Response[404, {}, ["Not Found"]]
   rescue => e
     Protocol::HTTP::Response[400, {}, ["Bad request: #{e.message}"]]
   end
-  
+
   def handle_websocket(request)
     Async::WebSocket::Response.for(request) do |stream|
       # Wrap stream with Protocol::WebSocket::Connection
       framer = Protocol::WebSocket::Framer.new(stream)
       connection = Protocol::WebSocket::Connection.new(framer)
-      
+
       # Register this connection
       client = {connection: connection, subscriptions: {}}
       @@connections_mutex.synchronize { @@connections << client }
-      
+
       begin
-      
+
         #connection.write(["NOTICE", "Nostr Relay - Connected"].to_json)
         #connection.flush
 
@@ -179,10 +141,10 @@ class NostrRelay
           loop do
             message = connection.read
             break unless message
-            
+
             # Extract text content from message object
             text = message.to_str
-            
+
             begin
               cmd, *args = JSON.parse(text)
               LOGGER.info "Received: #{text}"
@@ -231,20 +193,20 @@ class NostrRelay
     return false unless event["created_at"] && event["kind"]
     return false unless event["tags"].is_a?(Array)
     return false unless event["content"]
-    
+
     # NIP-22: Timestamp validation
     # Reject events with timestamps too far in future or past
     now = Time.now.to_i
     created_at = event["created_at"]
-    
+
     # Allow events up to 15 minutes in the future (clock skew)
     max_future = now + (15 * 60)
     # Allow events up to 3 years in the past
     min_past = now - (3 * 365 * 24 * 60 * 60)
-    
+
     return false if created_at > max_future
     return false if created_at < min_past
-    
+
     # Serialize event for ID calculation (NIP-01)
     serialized = JSON.generate([
       0,
@@ -254,17 +216,17 @@ class NostrRelay
       event["tags"],
       event["content"]
     ])
-    
+
     # Calculate and verify event ID
     calculated_id = Digest::SHA256.hexdigest(serialized)
     return false unless calculated_id == event["id"]
-    
+
     # Verify schnorr signature using bip-schnorr gem
     begin
       message = [event["id"]].pack('H*')
       public_key = [event["pubkey"]].pack('H*')
       signature = [event["sig"]].pack('H*')
-      
+
       Schnorr.valid_sig?(message, public_key, signature)
     rescue => e
       false
@@ -277,7 +239,7 @@ class NostrRelay
     unless valid
       return [false, "invalid: event signature verification failed"]
     end
-    
+
     # NIP-70: Reject protected events (events with "-" tag)
     # Protected events can only be published by the author after AUTH
     # Since we don't implement AUTH yet, reject all protected events
@@ -286,7 +248,7 @@ class NostrRelay
       # Reject protected events
       return [false, "auth-required: this event may only be published by its author"]
     end
-    
+
     # NIP-40: Filter out expired events
     expiration_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "expiration" }
     if expiration_tag && expiration_tag[1]
@@ -296,28 +258,28 @@ class NostrRelay
         return [false, "invalid: event has expired"]
       end
     end
-    
+
     # Handle kind 62 (request to vanish) - NIP-62
     if event["kind"] == 62 && DB
       # Check if this relay is targeted
       relay_tags = event["tags"].select { |t| t.is_a?(Array) && t[0] == "relay" }
       current_relay_url = ENV['RELAY_URL'] || "ws://localhost:8080"
-      
+
       is_targeted = relay_tags.any? do |tag|
         tag[1] == "ALL_RELAYS" || tag[1] == current_relay_url
       end
-      
+
       if is_targeted
         # Delete all events from this pubkey created before the vanish request
         DB[:event].where(pubkey: event["pubkey"])
           .where { created_at <= event["created_at"] }
           .delete
-        
+
         # Mark this pubkey as vanished to prevent re-broadcasting
         @@vanished_mutex.synchronize do
           @@vanished_pubkeys[event["pubkey"]] = event["created_at"]
         end
-        
+
         # Save the vanish request itself for bookkeeping
         DB[:event].insert(
           id: event["id"],
@@ -332,7 +294,7 @@ class NostrRelay
       # Don't broadcast vanish requests
       return [true, ""]
     end
-    
+
     # Prevent re-broadcasting vanished events
     @@vanished_mutex.synchronize do
       vanish_time = @@vanished_pubkeys[event["pubkey"]]
@@ -355,7 +317,7 @@ class NostrRelay
       # Don't save or broadcast the deletion event itself
       return [true, ""]
     end
-    
+
     # Handle ephemeral events (kind 20000-29999) - NIP-16
     kind = event["kind"]
     if kind >= 20000 && kind < 30000
@@ -384,7 +346,7 @@ class NostrRelay
         if DB[:event][:id => event["id"]]
           return [true, ""]
         end
-        
+
         # Handle replaceable events (kind 0, 3, 10000-19999)
         if kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
           # Regular replaceable: Replace older events with same kind and pubkey
@@ -402,11 +364,11 @@ class NostrRelay
           # Parameterized replaceable: Replace events with same kind, pubkey, and "d" tag
           d_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "d" }
           d_value = d_tag&.[](1) || ""
-          
+
           existing = DB[:event].where(kind: kind, pubkey: event["pubkey"])
             .where(Sequel.lit("tags @> ?", Sequel.pg_jsonb([["d", d_value]])))
             .first
-          
+
           if existing
             # Only replace if new event is newer
             if event["created_at"] > existing[:created_at]
@@ -417,7 +379,7 @@ class NostrRelay
             end
           end
         end
-        
+
         DB[:event].insert(
           id: event["id"],
           pubkey: event["pubkey"],
@@ -449,7 +411,7 @@ class NostrRelay
         end
       end
     end
-    
+
     # Return success
     [true, ""]
   end
@@ -467,7 +429,7 @@ class NostrRelay
       conn.flush
       return
     end
-    
+
     ds = DB[:event].order(Sequel.desc(:created_at))
 
     # Apply filters
@@ -481,7 +443,7 @@ class NostrRelay
         s = escape_like(f['search'])
         ds = ds.where{Sequel.like(:content, s)}
       end
-      
+
       # NIP-12: Generic tag queries (#e, #p, etc)
       f.each do |key, values|
         if key.start_with?('#') && values.is_a?(Array)
@@ -490,7 +452,7 @@ class NostrRelay
           ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
         end
       end
-      
+
       # Use limit from filter if present, otherwise max 500
       limit = f['limit'] ? [f['limit'], 500].min : 500
       ds = ds.limit(limit)
@@ -507,14 +469,14 @@ class NostrRelay
         "content" => row[:content],
         "sig" => row[:sig]
       }
-      
+
       # NIP-40: Skip expired events
       expiration_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "expiration" }
       if expiration_tag && expiration_tag[1]
         expiration_time = expiration_tag[1].to_i
         next if Time.now.to_i >= expiration_time
       end
-      
+
       conn.write(["EVENT", sub_id, event].to_json)
       conn.flush
     end
@@ -529,7 +491,7 @@ class NostrRelay
       conn.flush
       return
     end
-    
+
     ds = DB[:event].order(Sequel.desc(:created_at))
 
     # Apply filters
@@ -543,7 +505,7 @@ class NostrRelay
         s = escape_like(f['search'])
         ds = ds.where{Sequel.like(:content, s)}
       end
-      
+
       # NIP-12: Generic tag queries (#e, #p, etc)
       f.each do |key, values|
         if key.start_with?('#') && values.is_a?(Array)
@@ -552,7 +514,7 @@ class NostrRelay
           ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
         end
       end
-      
+
       # Use limit from filter if present, otherwise max 500
       limit = f['limit'] ? [f['limit'], 500].min : 500
       ds = ds.limit(limit)
@@ -569,14 +531,14 @@ class NostrRelay
         "content" => row[:content],
         "sig" => row[:sig]
       }
-      
+
       # NIP-40: Skip expired events
       expiration_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "expiration" }
       if expiration_tag && expiration_tag[1]
         expiration_time = expiration_tag[1].to_i
         next if Time.now.to_i >= expiration_time
       end
-      
+
       conn.write(["EVENT", sub_id, event].to_json)
       conn.flush
     end
@@ -594,7 +556,7 @@ class NostrRelay
       matches &&= f['kinds'].include?(event["kind"]) if f['kinds']
       matches &&= event["created_at"] >= f['since'] if f['since']
       matches &&= event["created_at"] <= f['until'] if f['until']
-      
+
       # NIP-12: Generic tag queries (#e, #p, etc)
       f.each do |key, values|
         if key.start_with?('#') && values.is_a?(Array)
@@ -604,9 +566,57 @@ class NostrRelay
           matches &&= values.any? { |v| tag_values.include?(v) }
         end
       end
-      
+
       matches
     end
+  end
+end
+
+# NIP-11: Relay Information Document middleware
+class RelayInfo
+  def initialize(app)
+    @app = app
+  end
+
+  def call(request)
+    # Return JSON metadata for HTTP GET requests with Accept: application/nostr+json
+    if request.method == "GET" &&
+       request.headers['accept']&.include?('application/nostr+json')
+      relay_info = {
+        name: ENV['RELAY_NAME'] || "Ruby Nostr Relay",
+        description: ENV['RELAY_DESCRIPTION'] || "A lightweight Nostr relay implementation in Ruby",
+        pubkey: ENV['RELAY_PUBKEY'] || "",
+        contact: ENV['RELAY_CONTACT'] || "",
+        icon: ENV['RELAY_ICON'] || "",
+        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 50, 62, 70],
+        software: "https://github.com/mattn/ruby-nostr-relay",
+        version: "1.0.0",
+        limitation: {
+          max_message_length: 65536,
+          max_subscriptions: 20,
+          max_filters: 10,
+          max_limit: 500,
+          max_subid_length: 100,
+          min_prefix: 4,
+          max_event_tags: 2000,
+          max_content_length: 65536,
+          min_pow_difficulty: 0,
+          auth_required: false,
+          payment_required: false
+        }
+      }
+
+      return Protocol::HTTP::Response[200,
+        {
+          'content-type' => 'application/json',
+          'access-control-allow-origin' => '*',
+          'access-control-allow-headers' => 'Content-Type, Accept',
+          'access-control-allow-methods' => 'GET'
+        },
+        [relay_info.to_json]]
+    end
+
+    @app.call(request)
   end
 end
 
@@ -644,14 +654,15 @@ if $0 == __FILE__
   require 'falcon/server'
   require 'async/reactor'
 
-  middleware = NostrRelay.new
-  static_files = StaticFiles.new(middleware, root: "public")
+  relay = NostrRelay.new
+  static_files = StaticFiles.new(relay, root: "public")
+  relay_info = RelayInfo.new(static_files)
   endpoint = Async::HTTP::Endpoint.parse("http://0.0.0.0:8080")
 
   LOGGER.info "Nostr Relay starting on ws://localhost:8080"
-  
+
   Async do
-    server = Falcon::Server.new(static_files, endpoint)
+    server = Falcon::Server.new(relay_info, endpoint)
     server.run
   end
 end
