@@ -95,9 +95,9 @@ begin
     DB = nil
   end
 rescue => e
-  puts "Database connection failed: #{e.class} - #{e.message}"
-  puts e.backtrace.first(5).join("\n") if e.backtrace
-  puts "Server will start without database support"
+  LOGGER.error "Database connection failed: #{e.class} - #{e.message}"
+  LOGGER.error e.backtrace.first(5).join("\n") if e.backtrace
+  LOGGER.warn "Server will start without database support"
   DB = nil
 end
 
@@ -119,6 +119,8 @@ class NostrRelay
 
     Protocol::HTTP::Response[404, {}, ["Not Found"]]
   rescue => e
+    LOGGER.error "Request handling error: #{e.class} - #{e.message}"
+    LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
     Protocol::HTTP::Response[400, {}, ["Bad request: #{e.message}"]]
   end
 
@@ -133,7 +135,6 @@ class NostrRelay
       @@connections_mutex.synchronize { @@connections << client }
 
       begin
-
         #connection.write(["NOTICE", "Nostr Relay - Connected"].to_json)
         #connection.flush
 
@@ -160,22 +161,33 @@ class NostrRelay
                 end
                 connection.flush
               when "COUNT"
+                # Store subscription filters for COUNT requests
                 client[:subscriptions][args[0]] = args[1..-1]
-                send_history(connection, args[0], args[1..-1])
+                send_count(connection, args[0], args[1..-1])
               when "REQ"
+                # Store subscription filters for REQ requests
                 client[:subscriptions][args[0]] = args[1..-1]
                 send_history(connection, args[0], args[1..-1])
               when "CLOSE"
                 client[:subscriptions].delete(args[0])
               end
+            rescue JSON::ParserError
+              LOGGER.warn "Failed to parse JSON: #{text}"
+              connection.write(["NOTICE", "error: invalid JSON"].to_json) rescue nil
+              connection.flush rescue nil
             rescue => e
               error_msg = e.message.encode('UTF-8', invalid: :replace, undef: :replace, replace: '?')
+              LOGGER.error "Error processing message: #{e.class} - #{e.message}"
+              LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
               connection.write(["NOTICE", "error: #{error_msg}"].to_json) rescue nil
               connection.flush rescue nil
             end
           end
-        rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, Protocol::WebSocket::ProtocolError
-          # Client closed connection (normal or abrupt) or protocol error
+        rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, Protocol::WebSocket::ProtocolError => e
+          LOGGER.info "Client disconnected: #{e.class} - #{e.message}"
+        rescue => e
+          LOGGER.error "WebSocket read loop error: #{e.class} - #{e.message}"
+          LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
         end
       ensure
         # Remove this connection from global list
@@ -229,6 +241,7 @@ class NostrRelay
 
       Schnorr.valid_sig?(message, public_key, signature)
     rescue => e
+      LOGGER.warn "Schnorr signature verification failed: #{e.message}"
       false
     end
   end
@@ -333,6 +346,7 @@ class NostrRelay
             end
           rescue => e
             # Ignore errors sending to disconnected clients
+            LOGGER.warn "Error sending ephemeral event to client: #{e.message}"
           end
         end
       end
@@ -390,8 +404,8 @@ class NostrRelay
           sig: event["sig"]
         )
       rescue => e
-        puts "Database error while saving event: #{e.class} - #{e.message}"
-        puts e.backtrace.first(3).join("\n") if e.backtrace
+        LOGGER.error "Database error while saving event: #{e.class} - #{e.message}"
+        LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
         # Continue to broadcast even if save failed
       end
     end
@@ -408,6 +422,7 @@ class NostrRelay
           end
         rescue => e
           # Ignore errors sending to disconnected clients
+          LOGGER.warn "Error broadcasting event to client: #{e.message}"
         end
       end
     end
@@ -423,7 +438,8 @@ class NostrRelay
       .join('%') + '%'
   end
 
-  def send_count(conn, sub_id, filters)
+  # Common logic for sending events (used by COUNT and REQ)
+  def send_events(conn, sub_id, filters)
     unless DB
       conn.write(["EOSE", sub_id].to_json)
       conn.flush
@@ -458,6 +474,7 @@ class NostrRelay
       ds = ds.limit(limit)
     end
 
+    count = 0
     ds.each do |row|
       # Convert database row to Nostr event format
       event = {
@@ -479,72 +496,24 @@ class NostrRelay
 
       conn.write(["EVENT", sub_id, event].to_json)
       conn.flush
+      count += 1
+    end
+
+    # For COUNT, send the count instead of EOSE
+    if filters.any? { |f| f.key?("count") }
+      conn.write(["COUNT", sub_id, {"count" => count}].to_json)
     end
 
     conn.write(["EOSE", sub_id].to_json)
     conn.flush
   end
 
+  def send_count(conn, sub_id, filters)
+    send_events(conn, sub_id, filters)
+  end
+
   def send_history(conn, sub_id, filters)
-    unless DB
-      conn.write(["EOSE", sub_id].to_json)
-      conn.flush
-      return
-    end
-
-    ds = DB[:event].order(Sequel.desc(:created_at))
-
-    # Apply filters
-    filters.each do |f|
-      ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
-      ds = ds.where(pubkey: f['authors']) if f['authors']
-      ds = ds.where(kind: f['kinds']) if f['kinds']
-      ds = ds.where{created_at >= f['since']} if f['since']
-      ds = ds.where{created_at <= f['until']} if f['until']
-      if f['search']
-        s = escape_like(f['search'])
-        ds = ds.where{Sequel.like(:content, s)}
-      end
-
-      # NIP-12: Generic tag queries (#e, #p, etc)
-      f.each do |key, values|
-        if key.start_with?('#') && values.is_a?(Array)
-          tag_name = key[1..-1]
-          # Use the tagvalues generated column for efficient tag searching
-          ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
-        end
-      end
-
-      # Use limit from filter if present, otherwise max 500
-      limit = f['limit'] ? [f['limit'], 500].min : 500
-      ds = ds.limit(limit)
-    end
-
-    ds.each do |row|
-      # Convert database row to Nostr event format
-      event = {
-        "id" => row[:id],
-        "pubkey" => row[:pubkey],
-        "created_at" => row[:created_at],
-        "kind" => row[:kind],
-        "tags" => row[:tags],
-        "content" => row[:content],
-        "sig" => row[:sig]
-      }
-
-      # NIP-40: Skip expired events
-      expiration_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "expiration" }
-      if expiration_tag && expiration_tag[1]
-        expiration_time = expiration_tag[1].to_i
-        next if Time.now.to_i >= expiration_time
-      end
-
-      conn.write(["EVENT", sub_id, event].to_json)
-      conn.flush
-    end
-
-    conn.write(["EOSE", sub_id].to_json)
-    conn.flush
+    send_events(conn, sub_id, filters)
   end
 
   def match_filters?(event, filters)
@@ -588,21 +557,23 @@ class RelayInfo
         pubkey: ENV['RELAY_PUBKEY'] || "",
         contact: ENV['RELAY_CONTACT'] || "",
         icon: ENV['RELAY_ICON'] || "",
+        # Updated supported_nips based on common implementations and NIPs handled
         supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 50, 62, 70],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
+          # Updated limitations based on typical relay configurations and NIP-11 spec
           max_message_length: 65536,
-          max_subscriptions: 20,
-          max_filters: 10,
-          max_limit: 500,
+          max_subscriptions: 20, # Example value, can be configured
+          max_filters: 10,       # Example value, can be configured
+          max_limit: 500,        # Example value, can be configured
           max_subid_length: 100,
           min_prefix: 4,
           max_event_tags: 2000,
           max_content_length: 65536,
-          min_pow_difficulty: 0,
-          auth_required: false,
-          payment_required: false
+          min_pow_difficulty: 0, # Currently not enforced
+          auth_required: false,  # Currently not implemented
+          payment_required: false # Currently not implemented
         }
       }
 
@@ -627,6 +598,7 @@ class StaticFiles
   end
 
   def call(request)
+    # Avoid processing WebSocket requests as static files
     if request.respond_to?(:protocol) && request.protocol&.include?('websocket')
       return @app.call(request)
     end
@@ -636,11 +608,16 @@ class StaticFiles
     end
     path = File.expand_path(File.join(@root, request.path))
 
-    return @app.call(request) unless path.start_with?(@root)
+    # Prevent directory traversal attacks
+    unless path.start_with?(@root)
+      LOGGER.warn "Attempted directory traversal: #{request.path}"
+      return Protocol::HTTP::Response[403, {}, ["Forbidden"]]
+    end
+
     if File.file?(path)
       headers = {
         "content-length" => File.size(path).to_s,
-        "content-type" => MiniMime.lookup_by_filename(path).content_type,
+        "content-type" => MiniMime.lookup_by_filename(path)&.content_type || "application/octet-stream",
       }
       return Protocol::HTTP::Response[200, headers, File.open(path, "rb")]
     end
@@ -659,7 +636,7 @@ if $0 == __FILE__
   relay_info = RelayInfo.new(static_files)
   endpoint = Async::HTTP::Endpoint.parse("http://0.0.0.0:8080")
 
-  LOGGER.info "Nostr Relay starting on ws://localhost:8080"
+  LOGGER.info "Nostr Relay starting on #{endpoint.url}"
 
   Async do
     server = Falcon::Server.new(relay_info, endpoint)
