@@ -152,8 +152,8 @@ class NostrRelay
               case cmd
               when "EVENT"
                 event = args[0]
-                # Broadcast event and send OK response (NIP-20)
-                success, message = broadcast_event(event)
+                # Handle event and send OK response
+                success, message = handle_event(event)
                 if success
                   connection.write(["OK", event["id"], true, ""].to_json)
                 else
@@ -246,7 +246,7 @@ class NostrRelay
     end
   end
 
-  def broadcast_event(event)
+  def handle_event(event)
     # Verify event signature (ID verification only - catches malformed events)
     valid = verify_event(event)
     unless valid
@@ -317,41 +317,7 @@ class NostrRelay
       end
     end
 
-    # Handle kind 5 (deletion) events
-    if event["kind"] == 5 && DB
-      # Extract event IDs to delete from "e" tags
-      event["tags"].each do |tag|
-        if tag.is_a?(Array) && tag[0] == "e" && tag[1]
-          event_id = tag[1]
-          # Only delete events from the same author
-          DB[:event].where(id: event_id, pubkey: event["pubkey"]).delete
-        end
-      end
-      # Don't save or broadcast the deletion event itself
-      return [true, ""]
-    end
-
-    # Handle ephemeral events (kind 20000-29999) - NIP-16
     kind = event["kind"]
-    if kind >= 20000 && kind < 30000
-      # Ephemeral events: broadcast only, don't save to database
-      @@connections_mutex.synchronize do
-        @@connections.each do |client|
-          begin
-            client[:subscriptions].each do |sub_id, filters|
-              if match_filters?(event, filters)
-                client[:connection].write(["EVENT", sub_id, event].to_json)
-                client[:connection].flush
-              end
-            end
-          rescue => e
-            # Ignore errors sending to disconnected clients
-            LOGGER.warn "Error sending ephemeral event to client: #{e.message}"
-          end
-        end
-      end
-      return [true, ""]
-    end
 
     # Save to database if connected
     if DB
@@ -361,8 +327,16 @@ class NostrRelay
           return [true, ""]
         end
 
-        # Handle replaceable events (kind 0, 3, 10000-19999)
-        if kind == 0 || kind == 3 || (kind >= 10000 && kind < 20000)
+        if kind == 5
+          # Deletion events
+          event["tags"].each do |tag|
+            if tag.is_a?(Array) && tag[0] == "e" && tag[1]
+              event_id = tag[1]
+              # Only delete events from the same author
+              DB[:event].where(id: event_id, pubkey: event["pubkey"]).delete
+            end
+          end
+        elsif kind == 0 || kind == 3 || (10000 <= kind && kind < 20000)
           # Regular replaceable: Replace older events with same kind and pubkey
           existing = DB[:event].where(kind: kind, pubkey: event["pubkey"]).first
           if existing
@@ -374,7 +348,7 @@ class NostrRelay
               return [false, "duplicate: newer event already exists"]
             end
           end
-        elsif kind >= 30000 && kind < 40000
+        elsif 30000 <= kind && kind < 40000
           # Parameterized replaceable: Replace events with same kind, pubkey, and "d" tag
           d_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "d" }
           d_value = d_tag&.[](1) || ""
@@ -394,15 +368,17 @@ class NostrRelay
           end
         end
 
-        DB[:event].insert(
-          id: event["id"],
-          pubkey: event["pubkey"],
-          kind: event["kind"],
-          created_at: event["created_at"],
-          tags: Sequel.pg_jsonb(event["tags"]),
-          content: event["content"],
-          sig: event["sig"]
-        )
+        unless kind == 5 || (20000 <= kind && kind < 30000)
+          DB[:event].insert(
+            id: event["id"],
+            pubkey: event["pubkey"],
+            kind: event["kind"],
+            created_at: event["created_at"],
+            tags: Sequel.pg_jsonb(event["tags"]),
+            content: event["content"],
+            sig: event["sig"]
+          )
+        end
       rescue => e
         LOGGER.error "Database error while saving event: #{e.class} - #{e.message}"
         LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
