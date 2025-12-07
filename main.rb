@@ -332,8 +332,17 @@ class NostrRelay
           event["tags"].each do |tag|
             if tag.is_a?(Array) && tag[0] == "e" && tag[1]
               event_id = tag[1]
-              # Only delete events from the same author
-              DB[:event].where(id: event_id, pubkey: event["pubkey"]).delete
+
+              target = DB[:event].where(id: event_id).first
+              if not target.nil? && target["kind"] == 1059
+                # Only delete events from the same author
+                DB[:event].where(id: event_id, kind: 1059)
+                  .where(Sequel.lit("tags @> ?", Sequel.pg_jsonb([["p", event["pubkey"]]])))
+                  .delete
+              else
+                # Only delete events from the same author
+                DB[:event].where(id: event_id, pubkey: event["pubkey"]).delete
+              end
             end
           end
         elsif kind == 0 || kind == 3 || (10000 <= kind && kind < 20000)
