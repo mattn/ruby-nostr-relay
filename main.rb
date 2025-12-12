@@ -328,20 +328,39 @@ class NostrRelay
         end
 
         if kind == 5
-          # Deletion events
+          # Deletion events (NIP-09)
+          # Extract kind filter from "k" tags if present
+          k_tags = event["tags"].select { |t| t.is_a?(Array) && t[0] == "k" && t[1] }
+          kind_filter = k_tags.map { |t| t[1].to_i } unless k_tags.empty?
+
           event["tags"].each do |tag|
             if tag.is_a?(Array) && tag[0] == "e" && tag[1]
               event_id = tag[1]
 
               target = DB[:event].where(id: event_id).first
-              if not target.nil? && target["kind"] == 1059
+              if target.nil?
+                LOGGER.info "Deletion: target event #{event_id} not found"
+                next
+              end
+
+              LOGGER.info "Deletion: found target event #{event_id}, kind=#{target[:kind]}, pubkey=#{target[:pubkey]}, deletion_pubkey=#{event["pubkey"]}"
+
+              # Apply kind filter if specified
+              if kind_filter && !kind_filter.include?(target[:kind])
+                LOGGER.info "Deletion: kind filter mismatch (filter=#{kind_filter}, target_kind=#{target[:kind]})"
+                next
+              end
+
+              if target[:kind] == 1059
                 # Only delete events from the same author
-                DB[:event].where(id: event_id, kind: 1059)
+                deleted = DB[:event].where(id: event_id, kind: 1059)
                   .where(Sequel.lit("tags @> ?", Sequel.pg_jsonb([["p", event["pubkey"]]])))
                   .delete
+                LOGGER.info "Deletion: deleted #{deleted} kind 1059 events"
               else
                 # Only delete events from the same author
-                DB[:event].where(id: event_id, pubkey: event["pubkey"]).delete
+                deleted = DB[:event].where(id: event_id, pubkey: event["pubkey"]).delete
+                LOGGER.info "Deletion: deleted #{deleted} events (pubkey match required)"
               end
             end
           end
