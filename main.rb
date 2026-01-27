@@ -183,8 +183,8 @@ class NostrRelay
               connection.flush rescue nil
             end
           end
-        rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, Protocol::WebSocket::ProtocolError => e
-          LOGGER.info "Client disconnected: #{e.class} - #{e.message}"
+        rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, Protocol::WebSocket::ProtocolError
+          LOGGER.info "Client disconnected"
         rescue => e
           LOGGER.error "WebSocket read loop error: #{e.class} - #{e.message}"
           LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
