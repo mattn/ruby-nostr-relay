@@ -89,6 +89,12 @@ begin
       LOGGER.info "Database table 'event' already exists"
     end
 
+    # NIP-50: accelerate substring search (LIKE '%...%') on content.
+    # pg_trgm trigram GIN index avoids a sequential scan even with a leading wildcard.
+    DB.run "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+    DB.run "CREATE INDEX IF NOT EXISTS contenttrgmidx ON event USING gin (content gin_trgm_ops);"
+    LOGGER.info "Content trigram index created/verified"
+
     LOGGER.info "Database setup completed successfully"
   else
     LOGGER.info "No DATABASE_URL provided, starting without database support"
@@ -124,7 +130,24 @@ class NostrRelay
     Protocol::HTTP::Response[400, {}, ["Bad request: #{e.message}"]]
   end
 
+  # Extract the real client IP from proxy headers (e.g. Cloudflare Tunnel /
+  # reverse proxy). Falls back to the peer address, or "-" when unknown.
+  def extract_forwarded_ip(request)
+    ['cf-connecting-ip', 'x-forwarded-for', 'x-real-ip'].each do |name|
+      value = request.headers[name]
+      value = value.first if value.is_a?(Array)
+      next if value.nil? || value.empty?
+      # X-Forwarded-For may be a comma separated list; take the first entry.
+      return value.split(',').first.strip
+    end
+    peer = request.respond_to?(:remote_address) ? request.remote_address : nil
+    peer ? peer.inspect_sockaddr : "-"
+  rescue
+    "-"
+  end
+
   def handle_websocket(request)
+    client_ip = extract_forwarded_ip(request)
     Async::WebSocket::Response.for(request) do |stream|
       # Wrap stream with Protocol::WebSocket::Connection
       framer = Protocol::WebSocket::Framer.new(stream)
@@ -133,6 +156,7 @@ class NostrRelay
       # Register this connection
       client = {connection: connection, subscriptions: {}}
       @@connections_mutex.synchronize { @@connections << client }
+      LOGGER.info "[#{client_ip}] Client connected"
 
       begin
         #connection.write(["NOTICE", "Nostr Relay - Connected"].to_json)
@@ -148,7 +172,7 @@ class NostrRelay
 
             begin
               cmd, *args = JSON.parse(text)
-              LOGGER.info "Received: #{text}"
+              LOGGER.info "[#{client_ip}] Received: #{text}"
               case cmd
               when "EVENT"
                 event = args[0]
@@ -172,21 +196,21 @@ class NostrRelay
                 client[:subscriptions].delete(args[0])
               end
             rescue JSON::ParserError
-              LOGGER.warn "Failed to parse JSON: #{text}"
+              LOGGER.warn "[#{client_ip}] Failed to parse JSON: #{text}"
               connection.write(["NOTICE", "error: invalid JSON"].to_json) rescue nil
               connection.flush rescue nil
             rescue => e
               error_msg = e.message.encode('UTF-8', invalid: :replace, undef: :replace, replace: '?')
-              LOGGER.error "Error processing message: #{e.class} - #{e.message}"
+              LOGGER.error "[#{client_ip}] Error processing message: #{e.class} - #{e.message}"
               LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
               connection.write(["NOTICE", "error: #{error_msg}"].to_json) rescue nil
               connection.flush rescue nil
             end
           end
         rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, Protocol::WebSocket::ProtocolError
-          LOGGER.info "Client disconnected"
+          LOGGER.info "[#{client_ip}] Client disconnected"
         rescue => e
-          LOGGER.error "WebSocket read loop error: #{e.class} - #{e.message}"
+          LOGGER.error "[#{client_ip}] WebSocket read loop error: #{e.class} - #{e.message}"
           LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
         end
       ensure
