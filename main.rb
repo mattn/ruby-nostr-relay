@@ -270,11 +270,90 @@ class NostrRelay
     end
   end
 
+  # NIP-26: Validate delegation tag if present
+  # Tag format: ["delegation", <delegator pubkey>, <conditions>, <signature>]
+  def validate_delegation(event)
+    delegation_tag = event["tags"].find { |t| t.is_a?(Array) && t.length >= 4 && t[0] == "delegation" }
+
+    # No delegation tag, nothing to validate
+    return true unless delegation_tag
+
+    return false unless delegation_tag.length == 4
+
+    delegator_pubkey = delegation_tag[1]
+    conditions = delegation_tag[2]
+    signature = delegation_tag[3]
+
+    return false unless delegator_pubkey.is_a?(String) && !delegator_pubkey.empty?
+    return false unless conditions.is_a?(String) && !conditions.empty?
+    return false unless signature.is_a?(String) && !signature.empty?
+
+    # Delegator pubkey must be 32 bytes of hex
+    return false unless delegator_pubkey.match?(/\A\h{64}\z/)
+
+    return false unless validate_delegation_conditions(event, conditions)
+
+    verify_delegation_signature(event["pubkey"], delegator_pubkey, conditions, signature)
+  end
+
+  # NIP-26: Check the event against the delegation conditions query string
+  # Supported fields: kind=<int>, created_at<<timestamp>, created_at><timestamp>
+  def validate_delegation_conditions(event, conditions)
+    kind_allowed = false
+    created_at_valid = true
+
+    conditions.split('&').each do |condition|
+      if condition.start_with?('kind=')
+        kind_str = condition.delete_prefix('kind=')
+        if kind_str.match?(/\A-?\d+\z/)
+          kind_allowed = true if event["kind"] == kind_str.to_i
+        end
+      elsif condition.start_with?('created_at<')
+        timestamp_str = condition.delete_prefix('created_at<')
+        if timestamp_str.match?(/\A-?\d+\z/)
+          created_at_valid = false if event["created_at"] >= timestamp_str.to_i
+        end
+      elsif condition.start_with?('created_at>')
+        timestamp_str = condition.delete_prefix('created_at>')
+        if timestamp_str.match?(/\A-?\d+\z/)
+          created_at_valid = false if event["created_at"] <= timestamp_str.to_i
+        end
+      end
+    end
+
+    kind_allowed && created_at_valid
+  end
+
+  # NIP-26: Verify the delegator's schnorr signature over the delegation token
+  # "nostr:delegation:<delegatee pubkey>:<conditions>"
+  def verify_delegation_signature(delegatee_pubkey, delegator_pubkey, conditions, signature)
+    # Signature must be 64 bytes of hex
+    return false unless signature.match?(/\A\h{128}\z/)
+
+    delegation_token = "nostr:delegation:#{delegatee_pubkey}:#{conditions}"
+
+    begin
+      message = Digest::SHA256.digest(delegation_token)
+      public_key = [delegator_pubkey].pack('H*')
+      sig = [signature].pack('H*')
+
+      Schnorr.valid_sig?(message, public_key, sig)
+    rescue => e
+      LOGGER.warn "Delegation signature verification failed: #{e.message}"
+      false
+    end
+  end
+
   def handle_event(event)
     # Verify event signature (ID verification only - catches malformed events)
     valid = verify_event(event)
     unless valid
       return [false, "invalid: event signature verification failed"]
+    end
+
+    # NIP-26: Reject events with an invalid or unsatisfied delegation tag
+    unless validate_delegation(event)
+      return [false, "invalid: delegation verification failed"]
     end
 
     # NIP-70: Reject protected events (events with "-" tag)
@@ -587,7 +666,7 @@ class RelayInfo
         icon: ENV['RELAY_ICON'] || "",
         relay_countries: (ENV['RELAY_COUNTRIES'] || "JP").split(',').map(&:strip).reject(&:empty?),
         # Updated supported_nips based on common implementations and NIPs handled
-        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 28, 33, 40, 50, 62, 70],
+        supported_nips: [1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 26, 28, 33, 40, 50, 62, 70],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
