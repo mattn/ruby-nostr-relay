@@ -675,7 +675,7 @@ class RelayInfo
         icon: ENV['RELAY_ICON'] || "",
         relay_countries: (ENV['RELAY_COUNTRIES'] || "JP").split(',').map(&:strip).reject(&:empty?),
         # Updated supported_nips based on common implementations and NIPs handled
-        supported_nips: [1, 4, 9, 11, 26, 40, 50, 62, 70, 78],
+        supported_nips: [1, 4, 9, 11, 26, 40, 50, 62, 66, 70, 78],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
