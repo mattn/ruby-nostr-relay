@@ -185,8 +185,6 @@ class NostrRelay
                 end
                 connection.flush
               when "COUNT"
-                # Store subscription filters for COUNT requests
-                client[:subscriptions][args[0]] = args[1..-1]
                 send_count(connection, args[0], args[1..-1])
               when "REQ"
                 # Store subscription filters for REQ requests
@@ -545,7 +543,7 @@ class NostrRelay
       .join('%') + '%'
   end
 
-  # Common logic for sending events (used by COUNT and REQ)
+  # Send stored events for a REQ subscription.
   def send_events(conn, sub_id, filters)
     unless DB
       conn.write(["EOSE", sub_id].to_json)
@@ -615,17 +613,53 @@ class NostrRelay
       count += 1
     end
 
-    # For COUNT, send the count instead of EOSE
-    if filters.any? { |f| f.key?("count") }
-      conn.write(["COUNT", sub_id, {"count" => count}].to_json)
-    end
-
     conn.write(["EOSE", sub_id].to_json)
     conn.flush
   end
 
   def send_count(conn, sub_id, filters)
-    send_events(conn, sub_id, filters)
+    unless DB
+      conn.write(["CLOSED", sub_id, "error: no database connection"].to_json)
+      conn.flush
+      return
+    end
+    unless sub_id.is_a?(String) && filters.is_a?(Array) && !filters.empty? && filters.all? { |f| f.is_a?(Hash) }
+      conn.write(["CLOSED", sub_id.to_s, "invalid: COUNT requires a query id and filters"].to_json)
+      conn.flush
+      return
+    end
+
+    # NIP-45 combines filters with OR and counts each matching event once.
+    # Query limits are REQ response limits and do not truncate COUNT results.
+    seen = {}
+    filters.each do |f|
+      ds = DB[:event]
+      ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
+      ds = ds.where(pubkey: f['authors']) if f['authors']
+      ds = ds.where(kind: f['kinds']) if f['kinds']
+      ds = ds.where { created_at >= f['since'] } if f['since']
+      ds = ds.where { created_at <= f['until'] } if f['until']
+      if f['search']
+        ds = ds.where { Sequel.like(:content, escape_like(f['search'])) }
+      end
+      f.each do |key, values|
+        if key.start_with?('#') && values.is_a?(Array)
+          ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
+        end
+      end
+      ds = ds.where(Sequel.lit(<<~SQL.strip))
+        NOT EXISTS (
+          SELECT 1 FROM jsonb_array_elements(tags) tag
+          WHERE tag->>0 = 'expiration'
+            AND tag->>1 ~ '^[0-9]+$'
+            AND (tag->>1)::bigint <= EXTRACT(EPOCH FROM NOW())::bigint
+        )
+      SQL
+      ds.select(:id).each { |row| seen[row[:id]] = true }
+    end
+
+    conn.write(["COUNT", sub_id, {"count" => seen.size}].to_json)
+    conn.flush
   end
 
   def send_history(conn, sub_id, filters)
@@ -675,7 +709,7 @@ class RelayInfo
         icon: ENV['RELAY_ICON'] || "",
         relay_countries: (ENV['RELAY_COUNTRIES'] || "JP").split(',').map(&:strip).reject(&:empty?),
         # Updated supported_nips based on common implementations and NIPs handled
-        supported_nips: [1, 4, 9, 11, 26, 40, 50, 62, 66, 70, 78],
+        supported_nips: [1, 4, 9, 11, 26, 40, 45, 50, 62, 66, 70, 78],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
