@@ -553,6 +553,15 @@ class NostrRelay
       return
     end
 
+    # limit: 0 contributes no stored events, but the original filters remain
+    # registered by the caller for live delivery after EOSE.
+    filters = filters.reject { |f| f['limit'] == 0 }
+    if filters.empty?
+      conn.write(["EOSE", sub_id].to_json)
+      conn.flush
+      return
+    end
+
     ds = DB[:event].order(Sequel.desc(:created_at))
 
     # Apply filters
