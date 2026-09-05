@@ -234,10 +234,12 @@ class NostrRelay
   def websocket_relay_url(request)
     host = request.headers['x-forwarded-host'] || request.headers['host']
     host = host.first if host.is_a?(Array)
+    host = request.authority if (host.nil? || host.empty?) && request.respond_to?(:authority)
     proto = request.headers['x-forwarded-proto']
     proto = proto.first if proto.is_a?(Array)
     scheme = proto == 'https' ? 'wss' : (proto == 'http' ? 'ws' : 'wss')
-    "#{scheme}://#{host.to_s.split(',').first.strip}"
+    authority = host.to_s.split(',').first.to_s.strip
+    "#{scheme}://#{authority}"
   end
 
   def normalize_relay_url(value)

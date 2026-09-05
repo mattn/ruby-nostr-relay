@@ -39,6 +39,12 @@ class NostrRelayAuthTest
     assert @client[:authenticated_pubkeys][@event['pubkey']]
   end
 
+  def test_uses_http2_authority_for_relay_url
+    request = Struct.new(:headers, :authority).new({}, 'relay.example.com')
+
+    assert @relay.send(:websocket_relay_url, request) == 'wss://relay.example.com'
+  end
+
   def test_rejects_wrong_challenge
     @event['tags'][1][1] = 'wrong'
 
