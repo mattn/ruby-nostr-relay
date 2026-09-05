@@ -33,6 +33,8 @@ require 'protocol/http/response'
 require 'sequel'
 require 'json'
 require 'digest'
+require 'securerandom'
+require 'uri'
 require 'schnorr'
 require 'mini_mime'
 
@@ -148,19 +150,25 @@ class NostrRelay
 
   def handle_websocket(request)
     client_ip = extract_forwarded_ip(request)
+    relay_url = websocket_relay_url(request)
     Async::WebSocket::Response.for(request) do |stream|
       # Wrap stream with Protocol::WebSocket::Connection
       framer = Protocol::WebSocket::Framer.new(stream)
       connection = Protocol::WebSocket::Connection.new(framer)
 
       # Register this connection
-      client = {connection: connection, subscriptions: {}}
+      client = {
+        connection: connection,
+        subscriptions: {},
+        challenge: SecureRandom.hex(32),
+        authenticated_pubkeys: {}
+      }
       @@connections_mutex.synchronize { @@connections << client }
       LOGGER.info "[#{client_ip}] Client connected"
 
       begin
-        #connection.write(["NOTICE", "Nostr Relay - Connected"].to_json)
-        #connection.flush
+        connection.write(["AUTH", client[:challenge]].to_json)
+        connection.flush
 
         begin
           loop do
@@ -177,7 +185,7 @@ class NostrRelay
               when "EVENT"
                 event = args[0]
                 # Handle event and send OK response
-                success, message = handle_event(event)
+                success, message = handle_event(event, client)
                 if success
                   connection.write(["OK", event["id"], true, ""].to_json)
                 else
@@ -185,11 +193,16 @@ class NostrRelay
                 end
                 connection.flush
               when "COUNT"
-                send_count(connection, args[0], args[1..-1])
+                send_count(connection, args[0], args[1..-1], client)
               when "REQ"
                 # Store subscription filters for REQ requests
                 client[:subscriptions][args[0]] = args[1..-1]
-                send_history(connection, args[0], args[1..-1])
+                send_history(connection, args[0], args[1..-1], client)
+              when "AUTH"
+                success, message = handle_auth(args[0], client, relay_url)
+                event_id = args[0].is_a?(Hash) ? args[0]["id"].to_s : ""
+                connection.write(["OK", event_id, success, message].to_json)
+                connection.flush
               when "CLOSE"
                 client[:subscriptions].delete(args[0])
               end
@@ -216,6 +229,45 @@ class NostrRelay
         @@connections_mutex.synchronize { @@connections.delete(client) }
       end
     end
+  end
+
+  def websocket_relay_url(request)
+    host = request.headers['x-forwarded-host'] || request.headers['host']
+    host = host.first if host.is_a?(Array)
+    proto = request.headers['x-forwarded-proto']
+    proto = proto.first if proto.is_a?(Array)
+    scheme = proto == 'https' ? 'wss' : (proto == 'http' ? 'ws' : 'wss')
+    "#{scheme}://#{host.to_s.split(',').first.strip}"
+  end
+
+  def normalize_relay_url(value)
+    uri = URI.parse(value)
+    return nil unless %w[ws wss].include?(uri.scheme) && uri.host
+    port = uri.port
+    default_port = (uri.scheme == 'wss' ? 443 : 80)
+    authority = port == default_port ? uri.host.downcase : "#{uri.host.downcase}:#{port}"
+    path = uri.path.to_s.sub(%r{/+\z}, '')
+    "#{uri.scheme.downcase}://#{authority}#{path}"
+  rescue URI::InvalidURIError
+    nil
+  end
+
+  def handle_auth(event, client, relay_url)
+    return [false, "invalid: malformed authentication event"] unless event.is_a?(Hash)
+    return [false, "invalid: authentication event must be kind 22242"] unless event["kind"] == 22242
+    return [false, "invalid: authentication event timestamp is out of range"] unless (Time.now.to_i - event["created_at"].to_i).abs <= 600
+    tags = event["tags"]
+    return [false, "invalid: authentication event tags are malformed"] unless tags.is_a?(Array)
+    return [false, "invalid: authentication challenge does not match"] unless tags.any? { |t| t.is_a?(Array) && t[0] == "challenge" && t[1] == client[:challenge] }
+    expected = normalize_relay_url(relay_url)
+    relay_matches = tags.any? do |t|
+      t.is_a?(Array) && t[0] == "relay" && normalize_relay_url(t[1].to_s) == expected
+    end
+    return [false, "invalid: authentication relay does not match"] unless relay_matches
+    return [false, "invalid: authentication signature verification failed"] unless verify_event(event)
+
+    client[:authenticated_pubkeys][event["pubkey"]] = true
+    [true, ""]
   end
 
   private
@@ -342,7 +394,7 @@ class NostrRelay
     end
   end
 
-  def handle_event(event)
+  def handle_event(event, publishing_client = nil)
     # Verify event signature (ID verification only - catches malformed events)
     valid = verify_event(event)
     unless valid
@@ -354,12 +406,10 @@ class NostrRelay
       return [false, "invalid: delegation verification failed"]
     end
 
-    # NIP-70: Reject protected events (events with "-" tag)
-    # Protected events can only be published by the author after AUTH
-    # Since we don't implement AUTH yet, reject all protected events
+    # NIP-70: Protected events may only be published after authenticating as
+    # the event author on this connection.
     protected_tag = event["tags"].find { |t| t.is_a?(Array) && t[0] == "-" }
-    if protected_tag
-      # Reject protected events
+    if protected_tag && !publishing_client&.dig(:authenticated_pubkeys, event["pubkey"])
       return [false, "auth-required: this event may only be published by its author"]
     end
 
@@ -520,7 +570,7 @@ class NostrRelay
       @@connections.each do |client|
         begin
           client[:subscriptions].each do |sub_id, filters|
-            if match_filters?(event, filters)
+            if match_filters?(event, filters) && gift_wrap_visible?(event, client)
               client[:connection].write(["EVENT", sub_id, event].to_json)
               client[:connection].flush
             end
@@ -536,6 +586,26 @@ class NostrRelay
     [true, ""]
   end
 
+  def gift_wrap_visible?(event, client)
+    return true unless event["kind"] == 1059
+    event["tags"].any? do |tag|
+      tag.is_a?(Array) && tag[0] == "p" && client[:authenticated_pubkeys][tag[1]]
+    end
+  end
+
+  def restrict_gift_wraps(ds, client)
+    pubkeys = client[:authenticated_pubkeys].keys
+    return ds.exclude(kind: 1059) if pubkeys.empty?
+
+    placeholders = Array.new(pubkeys.length, '?').join(', ')
+    ds.where(Sequel.lit(<<~SQL.strip, *pubkeys))
+      (kind <> 1059 OR EXISTS (
+        SELECT 1 FROM jsonb_array_elements(tags) tag
+        WHERE tag->>0 = 'p' AND tag->>1 IN (#{placeholders})
+      ))
+    SQL
+  end
+
   def escape_like(keywords)
     '%' + keywords
       .gsub(/[_%\\]/) { |m| "\\#{m}" }
@@ -544,7 +614,7 @@ class NostrRelay
   end
 
   # Send stored events for a REQ subscription.
-  def send_events(conn, sub_id, filters)
+  def send_events(conn, sub_id, filters, client)
     unless DB
       conn.write(["EOSE", sub_id].to_json)
       conn.flush
@@ -560,7 +630,7 @@ class NostrRelay
       return
     end
 
-    ds = DB[:event].order(Sequel.desc(:created_at))
+    ds = restrict_gift_wraps(DB[:event], client).order(Sequel.desc(:created_at))
 
     # Apply filters
     filters.each do |f|
@@ -617,7 +687,7 @@ class NostrRelay
     conn.flush
   end
 
-  def send_count(conn, sub_id, filters)
+  def send_count(conn, sub_id, filters, client)
     unless DB
       conn.write(["CLOSED", sub_id, "error: no database connection"].to_json)
       conn.flush
@@ -633,7 +703,7 @@ class NostrRelay
     # Query limits are REQ response limits and do not truncate COUNT results.
     seen = {}
     filters.each do |f|
-      ds = DB[:event]
+      ds = restrict_gift_wraps(DB[:event], client)
       ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
       ds = ds.where(pubkey: f['authors']) if f['authors']
       ds = ds.where(kind: f['kinds']) if f['kinds']
@@ -662,8 +732,8 @@ class NostrRelay
     conn.flush
   end
 
-  def send_history(conn, sub_id, filters)
-    send_events(conn, sub_id, filters)
+  def send_history(conn, sub_id, filters, client)
+    send_events(conn, sub_id, filters, client)
   end
 
   def match_filters?(event, filters)
@@ -709,7 +779,7 @@ class RelayInfo
         icon: ENV['RELAY_ICON'] || "",
         relay_countries: (ENV['RELAY_COUNTRIES'] || "JP").split(',').map(&:strip).reject(&:empty?),
         # Updated supported_nips based on common implementations and NIPs handled
-        supported_nips: [1, 4, 9, 11, 26, 40, 45, 50, 62, 66, 70, 78],
+        supported_nips: [1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 62, 66, 70, 78],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
@@ -723,7 +793,7 @@ class RelayInfo
           max_event_tags: 2000,
           max_content_length: 65536,
           min_pow_difficulty: 0, # Currently not enforced
-          auth_required: false,  # Currently not implemented
+          auth_required: false,  # Authentication is required only for restricted resources
           payment_required: false # Currently not implemented
         }
       }
