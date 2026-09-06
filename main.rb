@@ -608,11 +608,17 @@ class NostrRelay
     SQL
   end
 
-  def escape_like(keywords)
-    '%' + keywords
-      .gsub(/[_%\\]/) { |m| "\\#{m}" }
-      .split
-      .join('%') + '%'
+  # NIP-50: an event matches when every whitespace-separated word of the search
+  # string occurs in its content, case-insensitively. The stored query and
+  # match_filters? work from the same words, so a subscription answers the same
+  # before and after EOSE.
+  def search_terms(keywords)
+    keywords.to_s.split
+  end
+
+  # Escape the LIKE wildcards so a search for "%" cannot match everything.
+  def escape_like(word)
+    '%' + word.gsub(/[_%\\]/) { |m| "\\#{m}" } + '%'
   end
 
   # Send stored events for a REQ subscription.
@@ -642,8 +648,9 @@ class NostrRelay
       ds = ds.where{created_at >= f['since']} if f['since']
       ds = ds.where{created_at <= f['until']} if f['until']
       if f['search']
-        s = escape_like(f['search'])
-        ds = ds.where{Sequel.like(:content, s)}
+        search_terms(f['search']).each do |word|
+          ds = ds.where(Sequel.ilike(:content, escape_like(word)))
+        end
       end
 
       # NIP-12: Generic tag queries (#e, #p, etc)
@@ -712,11 +719,9 @@ class NostrRelay
       ds = ds.where { created_at >= f['since'] } if f['since']
       ds = ds.where { created_at <= f['until'] } if f['until']
       if f['search']
-        # escape_like has to be called outside the virtual row block: inside
-        # one Sequel would turn it into a SQL function call, and PostgreSQL
-        # has no escape_like(), so COUNT failed instead of counting.
-        s = escape_like(f['search'])
-        ds = ds.where { Sequel.like(:content, s) }
+        search_terms(f['search']).each do |word|
+          ds = ds.where(Sequel.ilike(:content, escape_like(word)))
+        end
       end
       f.each do |key, values|
         if key.start_with?('#') && values.is_a?(Array)
@@ -751,6 +756,14 @@ class NostrRelay
       matches &&= f['kinds'].include?(event["kind"]) if f['kinds']
       matches &&= event["created_at"] >= f['since'] if f['since']
       matches &&= event["created_at"] <= f['until'] if f['until']
+
+      # NIP-50: the stored query is a substring match over content, so the live
+      # path has to agree or the same subscription answers differently before
+      # and after EOSE.
+      if f['search']
+        content = event["content"].to_s.downcase
+        matches &&= search_terms(f['search']).all? { |word| content.include?(word.downcase) }
+      end
 
       # NIP-12: Generic tag queries (#e, #p, etc)
       f.each do |key, values|
