@@ -712,7 +712,11 @@ class NostrRelay
       ds = ds.where { created_at >= f['since'] } if f['since']
       ds = ds.where { created_at <= f['until'] } if f['until']
       if f['search']
-        ds = ds.where { Sequel.like(:content, escape_like(f['search'])) }
+        # escape_like has to be called outside the virtual row block: inside
+        # one Sequel would turn it into a SQL function call, and PostgreSQL
+        # has no escape_like(), so COUNT failed instead of counting.
+        s = escape_like(f['search'])
+        ds = ds.where { Sequel.like(:content, s) }
       end
       f.each do |key, values|
         if key.start_with?('#') && values.is_a?(Array)
