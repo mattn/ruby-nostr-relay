@@ -710,8 +710,10 @@ class NostrRelay
 
     # NIP-45 combines filters with OR and counts each matching event once.
     # Query limits are REQ response limits and do not truncate COUNT results.
-    seen = {}
-    filters.each do |f|
+    # The counting is left to PostgreSQL: pulling every matching id back to
+    # dedupe it here cost one id per stored event, and a COUNT over the whole
+    # relay grew the process by hundreds of megabytes that Ruby never returns.
+    datasets = filters.map do |f|
       ds = restrict_gift_wraps(DB[:event], client)
       ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
       ds = ds.where(pubkey: f['authors']) if f['authors']
@@ -736,10 +738,14 @@ class NostrRelay
             AND (tag->>1)::bigint <= EXTRACT(EPOCH FROM NOW())::bigint
         )
       SQL
-      ds.select(:id).each { |row| seen[row[:id]] = true }
+      ds.select(:id)
     end
 
-    conn.write(["COUNT", sub_id, {"count" => seen.size}].to_json)
+    # A single filter counts its own rows; ids are unique, so no deduplication
+    # is needed. Several filters are combined with UNION, which drops the
+    # duplicates an event matching more than one filter would contribute.
+    combined = datasets.inject { |a, b| a.union(b) }
+    conn.write(["COUNT", sub_id, {"count" => combined.count}].to_json)
     conn.flush
   end
 
