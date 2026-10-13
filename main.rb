@@ -25,6 +25,7 @@ require 'bundler/setup'
 LOGGER.info "Loading dependencies..."
 
 require 'async'
+require 'async/queue'
 require 'async/websocket/response'
 require 'protocol/websocket/connection'
 require 'protocol/websocket/framer'
@@ -45,7 +46,12 @@ LOGGER.info "Initializing database connection..."
 begin
   db_url = ENV['DATABASE_URL']
   if db_url && !db_url.empty?
-    DB = Sequel.connect(db_url)
+    # Every client runs in a fiber of the same thread, so Sequel's default
+    # per-thread pool would hand them all one PostgreSQL connection and let
+    # their queries interleave on its socket. Check connections out per fiber,
+    # and let a busy fiber wait longer for one than the 5 second default.
+    Sequel.extension :fiber_concurrency
+    DB = Sequel.connect(db_url, pool_timeout: 30)
     DB.extension :pg_json
 
     LOGGER.info "Connected to database: custom"
@@ -119,6 +125,10 @@ class NostrRelay
   @@vanished_pubkeys = {}
   @@vanished_mutex = Mutex.new
 
+  # Interval between WebSocket pings. Cloudflare Tunnel drops sockets that stay
+  # idle for 100 seconds, so keep well under that.
+  PING_INTERVAL = 30
+
   def call(request)
     # Check for WebSocket connection
     if request.respond_to?(:protocol) && request.protocol&.include?('websocket')
@@ -156,9 +166,13 @@ class NostrRelay
       framer = Protocol::WebSocket::Framer.new(stream)
       connection = Protocol::WebSocket::Connection.new(framer)
 
-      # Register this connection
+      # Register this connection. Every outgoing message goes through the
+      # outbox and is written by a single writer task, so fibers handling other
+      # clients (broadcasts) never write to this socket concurrently.
       client = {
         connection: connection,
+        outbox: Async::Queue.new,
+        closed: false,
         subscriptions: {},
         challenge: SecureRandom.hex(32),
         authenticated_pubkeys: {}
@@ -166,9 +180,18 @@ class NostrRelay
       @@connections_mutex.synchronize { @@connections << client }
       LOGGER.info "[#{client_ip}] Client connected"
 
+      task = Async::Task.current
+      writer = task.async { run_writer(client, client_ip) }
+      pinger = task.async do |t|
+        loop do
+          t.sleep PING_INTERVAL
+          break if client[:closed]
+          client[:outbox] << :ping
+        end
+      end
+
       begin
-        connection.write(["AUTH", client[:challenge]].to_json)
-        connection.flush
+        send_message(client, ["AUTH", client[:challenge]])
 
         begin
           loop do
@@ -187,35 +210,31 @@ class NostrRelay
                 # Handle event and send OK response
                 success, message = handle_event(event, client)
                 if success
-                  connection.write(["OK", event["id"], true, ""].to_json)
+                  send_message(client, ["OK", event["id"], true, ""])
                 else
-                  connection.write(["OK", event["id"], false, message || "rejected: invalid event"].to_json)
+                  send_message(client, ["OK", event["id"], false, message || "rejected: invalid event"])
                 end
-                connection.flush
               when "COUNT"
-                send_count(connection, args[0], args[1..-1], client)
+                send_count(client, args[0], args[1..-1])
               when "REQ"
                 # Store subscription filters for REQ requests
                 client[:subscriptions][args[0]] = args[1..-1]
-                send_history(connection, args[0], args[1..-1], client)
+                send_history(client, args[0], args[1..-1])
               when "AUTH"
                 success, message = handle_auth(args[0], client, relay_url)
                 event_id = args[0].is_a?(Hash) ? args[0]["id"].to_s : ""
-                connection.write(["OK", event_id, success, message].to_json)
-                connection.flush
+                send_message(client, ["OK", event_id, success, message])
               when "CLOSE"
                 client[:subscriptions].delete(args[0])
               end
             rescue JSON::ParserError
               LOGGER.warn "[#{client_ip}] Failed to parse JSON: #{text}"
-              connection.write(["NOTICE", "error: invalid JSON"].to_json) rescue nil
-              connection.flush rescue nil
+              send_message(client, ["NOTICE", "error: invalid JSON"])
             rescue => e
               error_msg = e.message.encode('UTF-8', invalid: :replace, undef: :replace, replace: '?')
               LOGGER.error "[#{client_ip}] Error processing message: #{e.class} - #{e.message}"
               LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
-              connection.write(["NOTICE", "error: #{error_msg}"].to_json) rescue nil
-              connection.flush rescue nil
+              send_message(client, ["NOTICE", "error: #{error_msg}"])
             end
           end
         rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, Protocol::WebSocket::ProtocolError
@@ -226,9 +245,41 @@ class NostrRelay
         end
       ensure
         # Remove this connection from global list
+        client[:closed] = true
         @@connections_mutex.synchronize { @@connections.delete(client) }
+        pinger.stop
+        writer.stop
       end
     end
+  end
+
+  # Queue a message for the client's writer task. Safe to call from any fiber.
+  def send_message(client, message)
+    return if client[:closed]
+    client[:outbox] << message.to_json
+  end
+
+  # The only place that writes to a client's socket.
+  def run_writer(client, client_ip)
+    connection = client[:connection]
+    while (item = client[:outbox].dequeue)
+      if item == :ping
+        connection.send_ping
+      else
+        connection.write(item)
+      end
+      connection.flush
+    end
+  rescue EOFError, Errno::EPIPE, Errno::ECONNRESET, IOError, Protocol::WebSocket::ProtocolError => e
+    LOGGER.info "[#{client_ip}] Write failed: #{e.class} - #{e.message}"
+  rescue => e
+    LOGGER.error "[#{client_ip}] WebSocket writer error: #{e.class} - #{e.message}"
+    LOGGER.error e.backtrace.first(3).join("\n") if e.backtrace
+  ensure
+    # Stop queueing for a client whose socket can no longer be written.
+    client[:closed] = true
+    client[:outbox].items.clear
+    @@connections_mutex.synchronize { @@connections.delete(client) }
   end
 
   def websocket_relay_url(request)
@@ -567,20 +618,18 @@ class NostrRelay
       end
     end
 
-    # Broadcast to all connected clients with matching subscriptions
-    @@connections_mutex.synchronize do
-      @@connections.each do |client|
-        begin
-          client[:subscriptions].each do |sub_id, filters|
-            if match_filters?(event, filters) && gift_wrap_visible?(event, client)
-              client[:connection].write(["EVENT", sub_id, event].to_json)
-              client[:connection].flush
-            end
+    # Broadcast to all connected clients with matching subscriptions. Only the
+    # snapshot is taken under the lock; messages go to each client's outbox.
+    clients = @@connections_mutex.synchronize { @@connections.dup }
+    clients.each do |client|
+      begin
+        client[:subscriptions].each do |sub_id, filters|
+          if match_filters?(event, filters) && gift_wrap_visible?(event, client)
+            send_message(client, ["EVENT", sub_id, event])
           end
-        rescue => e
-          # Ignore errors sending to disconnected clients
-          LOGGER.warn "Error broadcasting event to client: #{e.message}"
         end
+      rescue => e
+        LOGGER.warn "Error broadcasting event to client: #{e.message}"
       end
     end
 
@@ -622,10 +671,9 @@ class NostrRelay
   end
 
   # Send stored events for a REQ subscription.
-  def send_events(conn, sub_id, filters, client)
+  def send_events(client, sub_id, filters)
     unless DB
-      conn.write(["EOSE", sub_id].to_json)
-      conn.flush
+      send_message(client, ["EOSE", sub_id])
       return
     end
 
@@ -633,8 +681,7 @@ class NostrRelay
     # registered by the caller for live delivery after EOSE.
     filters = filters.reject { |f| f['limit'] == 0 }
     if filters.empty?
-      conn.write(["EOSE", sub_id].to_json)
-      conn.flush
+      send_message(client, ["EOSE", sub_id])
       return
     end
 
@@ -687,24 +734,20 @@ class NostrRelay
         next if Time.now.to_i >= expiration_time
       end
 
-      conn.write(["EVENT", sub_id, event].to_json)
-      conn.flush
+      send_message(client, ["EVENT", sub_id, event])
       count += 1
     end
 
-    conn.write(["EOSE", sub_id].to_json)
-    conn.flush
+    send_message(client, ["EOSE", sub_id])
   end
 
-  def send_count(conn, sub_id, filters, client)
+  def send_count(client, sub_id, filters)
     unless DB
-      conn.write(["CLOSED", sub_id, "error: no database connection"].to_json)
-      conn.flush
+      send_message(client, ["CLOSED", sub_id, "error: no database connection"])
       return
     end
     unless sub_id.is_a?(String) && filters.is_a?(Array) && !filters.empty? && filters.all? { |f| f.is_a?(Hash) }
-      conn.write(["CLOSED", sub_id.to_s, "invalid: COUNT requires a query id and filters"].to_json)
-      conn.flush
+      send_message(client, ["CLOSED", sub_id.to_s, "invalid: COUNT requires a query id and filters"])
       return
     end
 
@@ -745,12 +788,11 @@ class NostrRelay
     # is needed. Several filters are combined with UNION, which drops the
     # duplicates an event matching more than one filter would contribute.
     combined = datasets.inject { |a, b| a.union(b) }
-    conn.write(["COUNT", sub_id, {"count" => combined.count}].to_json)
-    conn.flush
+    send_message(client, ["COUNT", sub_id, {"count" => combined.count}])
   end
 
-  def send_history(conn, sub_id, filters, client)
-    send_events(conn, sub_id, filters, client)
+  def send_history(client, sub_id, filters)
+    send_events(client, sub_id, filters)
   end
 
   def match_filters?(event, filters)
