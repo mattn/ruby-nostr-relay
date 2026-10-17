@@ -677,9 +677,9 @@ class NostrRelay
       return
     end
 
-    # limit: 0 contributes no stored events, but the original filters remain
-    # registered by the caller for live delivery after EOSE.
-    filters = filters.reject { |f| f['limit'] == 0 }
+    # limit: 0 and unsatisfiable filters contribute no stored events, but the
+    # original filters remain registered by the caller for live delivery after EOSE.
+    filters = filters.reject { |f| f['limit'] == 0 || unsatisfiable_filter?(f) }
     if filters.empty?
       send_message(client, ["EOSE", sub_id])
       return
@@ -756,7 +756,12 @@ class NostrRelay
     # The counting is left to PostgreSQL: pulling every matching id back to
     # dedupe it here cost one id per stored event, and a COUNT over the whole
     # relay grew the process by hundreds of megabytes that Ruby never returns.
-    datasets = filters.map do |f|
+    satisfiable = filters.reject { |f| unsatisfiable_filter?(f) }
+    if satisfiable.empty?
+      send_message(client, ["COUNT", sub_id, {"count" => 0}])
+      return
+    end
+    datasets = satisfiable.map do |f|
       ds = restrict_gift_wraps(DB[:event], client)
       ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
       ds = ds.where(pubkey: f['authors']) if f['authors']
@@ -795,8 +800,17 @@ class NostrRelay
     send_events(client, sub_id, filters)
   end
 
+  # NIP-01: an empty ids/authors/kinds/tag list can never be satisfied, so the
+  # filter matches nothing instead of treating the attribute as absent.
+  def unsatisfiable_filter?(f)
+    f.any? do |key, values|
+      (%w[ids authors kinds].include?(key) || key.start_with?('#')) && values.is_a?(Array) && values.empty?
+    end
+  end
+
   def match_filters?(event, filters)
     filters.any? do |f|
+      next false if unsatisfiable_filter?(f)
       # Basic filters
       matches = true
       matches &&= f['ids'].any? { |p| event["id"].start_with?(p) } if f['ids']

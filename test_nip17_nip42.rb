@@ -58,6 +58,17 @@ class NostrRelayAuthTest
     @client[:authenticated_pubkeys][@event['pubkey']] = true
     assert @relay.send(:gift_wrap_visible?, gift_wrap, @client)
   end
+
+  def test_empty_filter_lists_match_nothing
+    event = {'id' => 'a' * 64, 'pubkey' => 'b' * 64, 'created_at' => 1, 'kind' => 1, 'tags' => [], 'content' => ''}
+
+    assert @relay.send(:match_filters?, event, [{'limit' => 3}])
+    [{'ids' => []}, {'authors' => []}, {'kinds' => []}, {'#e' => []}].each do |f|
+      assert @relay.send(:unsatisfiable_filter?, f), "#{f} should be unsatisfiable"
+      refute @relay.send(:match_filters?, event, [f]), "#{f} should match nothing"
+    end
+    refute @relay.send(:unsatisfiable_filter?, {'kinds' => [1], 'limit' => 3})
+  end
 end
 
 NostrRelayAuthTest.instance_methods(false).grep(/^test_/).each do |test|
