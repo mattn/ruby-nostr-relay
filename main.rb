@@ -685,34 +685,18 @@ class NostrRelay
       return
     end
 
-    ds = restrict_gift_wraps(DB[:event], client).order(Sequel.desc(:created_at))
-
-    # Apply filters
-    filters.each do |f|
-      ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
-      ds = ds.where(pubkey: f['authors']) if f['authors']
-      ds = ds.where(kind: f['kinds']) if f['kinds']
-      ds = ds.where{created_at >= f['since']} if f['since']
-      ds = ds.where{created_at <= f['until']} if f['until']
-      if f['search']
-        search_terms(f['search']).each do |word|
-          ds = ds.where(Sequel.ilike(:content, escape_like(word)))
-        end
-      end
-
-      # NIP-12: Generic tag queries (#e, #p, etc)
-      f.each do |key, values|
-        if key.start_with?('#') && values.is_a?(Array)
-          tag_name = key[1..-1]
-          # Use the tagvalues generated column for efficient tag searching
-          ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
-        end
-      end
-
+    # NIP-01: filters are combined with OR and each limit applies to its own
+    # filter, so every filter is its own query and UNION drops the events that
+    # match more than one of them.
+    datasets = filters.map do |f|
       # Use limit from filter if present, otherwise max 500
       limit = f['limit'] ? [f['limit'], 500].min : 500
-      ds = ds.limit(limit)
+      filter_dataset(client, f)
+        .select(:id, :pubkey, :created_at, :kind, :tags, :content, :sig)
+        .order(Sequel.desc(:created_at))
+        .limit(limit)
     end
+    ds = datasets.inject { |a, b| a.union(b) }.order(Sequel.desc(:created_at))
 
     count = 0
     ds.each do |row|
@@ -762,22 +746,7 @@ class NostrRelay
       return
     end
     datasets = satisfiable.map do |f|
-      ds = restrict_gift_wraps(DB[:event], client)
-      ds = ds.where(Sequel.like(:id, "#{f['ids']&.first}%")) if f['ids']&.first
-      ds = ds.where(pubkey: f['authors']) if f['authors']
-      ds = ds.where(kind: f['kinds']) if f['kinds']
-      ds = ds.where { created_at >= f['since'] } if f['since']
-      ds = ds.where { created_at <= f['until'] } if f['until']
-      if f['search']
-        search_terms(f['search']).each do |word|
-          ds = ds.where(Sequel.ilike(:content, escape_like(word)))
-        end
-      end
-      f.each do |key, values|
-        if key.start_with?('#') && values.is_a?(Array)
-          ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
-        end
-      end
+      ds = filter_dataset(client, f)
       ds = ds.where(Sequel.lit(<<~SQL.strip))
         NOT EXISTS (
           SELECT 1 FROM jsonb_array_elements(tags) tag
@@ -794,6 +763,30 @@ class NostrRelay
     # duplicates an event matching more than one filter would contribute.
     combined = datasets.inject { |a, b| a.union(b) }
     send_message(client, ["COUNT", sub_id, {"count" => combined.count}])
+  end
+
+  # The stored events one filter selects. Conditions within a filter are ANDed.
+  def filter_dataset(client, f)
+    ds = restrict_gift_wraps(DB[:event], client)
+    ds = ds.where(id: f['ids']) if f['ids']
+    ds = ds.where(pubkey: f['authors']) if f['authors']
+    ds = ds.where(kind: f['kinds']) if f['kinds']
+    ds = ds.where { created_at >= f['since'] } if f['since']
+    ds = ds.where { created_at <= f['until'] } if f['until']
+    if f['search']
+      search_terms(f['search']).each do |word|
+        ds = ds.where(Sequel.ilike(:content, escape_like(word)))
+      end
+    end
+
+    # NIP-12: Generic tag queries (#e, #p, etc)
+    f.each do |key, values|
+      if key.start_with?('#') && values.is_a?(Array)
+        # Use the tagvalues generated column for efficient tag searching
+        ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
+      end
+    end
+    ds
   end
 
   def send_history(client, sub_id, filters)
