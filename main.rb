@@ -812,7 +812,7 @@ class NostrRelay
       next false if unsatisfiable_filter?(f)
       # Basic filters
       matches = true
-      matches &&= f['ids'].any? { |p| event["id"].start_with?(p) } if f['ids']
+      matches &&= f['ids'].include?(event["id"]) if f['ids']
       matches &&= f['authors'].include?(event["pubkey"]) if f['authors']
       matches &&= f['kinds'].include?(event["kind"]) if f['kinds']
       matches &&= event["created_at"] >= f['since'] if f['since']

@@ -103,6 +103,14 @@ class NostrRelayAuthTest
     end
   end
 
+  # NIP-01: ids are exact 64-character values, not prefixes, as in the stored query.
+  def test_live_ids_match_exactly
+    event = {'id' => 'a' * 64, 'pubkey' => 'b' * 64, 'created_at' => 1, 'kind' => 1, 'tags' => [], 'content' => ''}
+
+    assert @relay.send(:match_filters?, event, [{'ids' => ['a' * 64]}]), 'the full id must match'
+    refute @relay.send(:match_filters?, event, [{'ids' => ['a' * 8]}]), 'a prefix of the id must not match'
+  end
+
   # NIP-01: #x needs a tag named x with one of the values, and different tag
   # conditions in one filter are ANDed. Needs DATABASE_URL for the stored path.
   def test_tag_filters_check_the_tag_name
