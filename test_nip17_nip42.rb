@@ -69,6 +69,39 @@ class NostrRelayAuthTest
     end
     refute @relay.send(:unsatisfiable_filter?, {'kinds' => [1], 'limit' => 3})
   end
+
+  # NIP-01: filters are ORed, each limit applies to its own filter and an event
+  # matching several filters is sent (and counted) once. Needs DATABASE_URL.
+  def test_multiple_filters_are_ored
+    return unless DB
+
+    ids = %w[1 2 3].map { |c| c * 64 }
+    ids.each_with_index do |id, i|
+      DB[:event].insert(id: id, pubkey: 'd' * 64, created_at: 100 + i, kind: 1,
+                        tags: Sequel.pg_jsonb([]), content: '', sig: 'e' * 128)
+    end
+    begin
+      received = lambda do |filters|
+        client = {outbox: [], authenticated_pubkeys: {}}
+        @relay.send(:send_events, client, 's', filters)
+        client[:outbox].map { |m| JSON.parse(m) }.select { |m| m[0] == 'EVENT' }.map { |m| m[2]['id'] }
+      end
+      counted = lambda do |filters|
+        client = {outbox: [], authenticated_pubkeys: {}}
+        @relay.send(:send_count, client, 'c', filters)
+        JSON.parse(client[:outbox].first)[2]['count']
+      end
+
+      assert received.call([{'ids' => [ids[0]]}, {'ids' => [ids[1]]}]).sort == ids[0, 2].sort, 'filters must be ORed'
+      assert received.call([{'ids' => ids}]).sort == ids.sort, 'every id must count'
+      assert received.call([{'ids' => ids, 'limit' => 1}, {'ids' => [ids[0]], 'limit' => 5}]).sort == [ids[0], ids[2]].sort,
+             'each limit applies to its own filter'
+      assert received.call([{'ids' => [ids[0]]}, {'ids' => [ids[0]]}]) == [ids[0]], 'an event is sent once'
+      assert counted.call([{'ids' => ids[0, 2]}, {'ids' => ids[1, 2]}]) == 3, 'COUNT counts the union'
+    ensure
+      DB[:event].where(id: ids).delete
+    end
+  end
 end
 
 NostrRelayAuthTest.instance_methods(false).grep(/^test_/).each do |test|
