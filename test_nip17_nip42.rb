@@ -102,6 +102,48 @@ class NostrRelayAuthTest
       DB[:event].where(id: ids).delete
     end
   end
+
+  # NIP-01: #x needs a tag named x with one of the values, and different tag
+  # conditions in one filter are ANDed. Needs DATABASE_URL for the stored path.
+  def test_tag_filters_check_the_tag_name
+    x = 'f' * 64
+    e_tagged = {'id' => '4' * 64, 'tags' => [['e', x]]}
+    p_tagged = {'id' => '5' * 64, 'tags' => [['p', x]]}
+    both = {'id' => '6' * 64, 'tags' => [['e', x], ['t', 'nostr']]}
+    events = [e_tagged, p_tagged, both].each_with_index.map do |ev, i|
+      ev.merge('pubkey' => 'd' * 64, 'created_at' => 200 + i, 'kind' => 1, 'content' => '', 'sig' => 'e' * 128)
+    end
+
+    live = lambda { |f| events.select { |ev| @relay.send(:match_filters?, ev, [f]) }.map { |ev| ev['id'] }.sort }
+    assert live.call({'#e' => [x]}) == [e_tagged['id'], both['id']].sort, 'live #e must ignore p tags'
+    assert live.call({'#e' => [x], '#t' => ['nostr']}) == [both['id']], 'live tag conditions are ANDed'
+
+    return unless DB
+
+    events.each do |ev|
+      DB[:event].insert(id: ev['id'], pubkey: ev['pubkey'], created_at: ev['created_at'], kind: 1,
+                        tags: Sequel.pg_jsonb(ev['tags']), content: '', sig: ev['sig'])
+    end
+    begin
+      received = lambda do |filters|
+        client = {outbox: [], authenticated_pubkeys: {}}
+        @relay.send(:send_events, client, 's', filters)
+        client[:outbox].map { |m| JSON.parse(m) }.select { |m| m[0] == 'EVENT' }.map { |m| m[2]['id'] }.sort
+      end
+      counted = lambda do |filters|
+        client = {outbox: [], authenticated_pubkeys: {}}
+        @relay.send(:send_count, client, 'c', filters)
+        JSON.parse(client[:outbox].first)[2]['count']
+      end
+
+      assert received.call([{'#e' => [x]}]) == [e_tagged['id'], both['id']].sort, '#e must not match a p tag'
+      assert received.call([{'#p' => [x]}]) == [p_tagged['id']], '#p must not match an e tag'
+      assert received.call([{'#e' => [x], '#t' => ['nostr']}]) == [both['id']], 'tag conditions are ANDed'
+      assert counted.call([{'#e' => [x]}]) == 2, 'COUNT checks the tag name'
+    ensure
+      DB[:event].where(id: events.map { |ev| ev['id'] }).delete
+    end
+  end
 end
 
 NostrRelayAuthTest.instance_methods(false).grep(/^test_/).each do |test|
