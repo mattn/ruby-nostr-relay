@@ -782,8 +782,14 @@ class NostrRelay
     # NIP-12: Generic tag queries (#e, #p, etc)
     f.each do |key, values|
       if key.start_with?('#') && values.is_a?(Array)
-        # Use the tagvalues generated column for efficient tag searching
+        # Use the tagvalues generated column for efficient tag searching, but
+        # it holds the values of every single-letter tag, so the tag name has
+        # to be checked too or #e would also match an equal value in a p tag.
         ds = ds.where(Sequel.lit("tagvalues && ARRAY[?]::text[]", values))
+        ds = ds.where(Sequel.lit(
+          "EXISTS (SELECT 1 FROM jsonb_array_elements(tags) t WHERE t->>0 = ? AND t->>1 = ANY(ARRAY[?]::text[]))",
+          key[1..-1], values
+        ))
       end
     end
     ds
@@ -806,7 +812,7 @@ class NostrRelay
       next false if unsatisfiable_filter?(f)
       # Basic filters
       matches = true
-      matches &&= f['ids'].any? { |p| event["id"].start_with?(p) } if f['ids']
+      matches &&= f['ids'].include?(event["id"]) if f['ids']
       matches &&= f['authors'].include?(event["pubkey"]) if f['authors']
       matches &&= f['kinds'].include?(event["kind"]) if f['kinds']
       matches &&= event["created_at"] >= f['since'] if f['since']
