@@ -129,6 +129,31 @@ class NostrRelay
   # idle for 100 seconds, so keep well under that.
   PING_INTERVAL = 30
 
+  # NIP-13: Minimum proof of work difficulty required for events (0 disables it)
+  MIN_POW_DIFFICULTY = Integer(ENV['MIN_POW_DIFFICULTY'] || '0', exception: false) || 0
+
+  # NIP-13: Count the number of leading zero bits in a hex-encoded event id
+  def self.pow_difficulty(hex)
+    count = 0
+    hex.to_s.each_char do |c|
+      break unless c.match?(/\h/)
+      nibble = c.to_i(16)
+      if nibble == 0
+        count += 4
+        next
+      end
+      if nibble <= 1
+        count += 3
+      elsif nibble <= 3
+        count += 2
+      elsif nibble <= 7
+        count += 1
+      end
+      break
+    end
+    count
+  end
+
   def call(request)
     # Check for WebSocket connection
     if request.respond_to?(:protocol) && request.protocol&.include?('websocket')
@@ -325,6 +350,10 @@ class NostrRelay
 
   private
 
+  def min_pow_difficulty
+    MIN_POW_DIFFICULTY
+  end
+
   def verify_event(event)
     # Verify event structure
     return false unless event.is_a?(Hash)
@@ -473,6 +502,15 @@ class NostrRelay
       if Time.now.to_i >= expiration_time
         # Event has expired, don't broadcast or save
         return [false, "invalid: event has expired"]
+      end
+    end
+
+    # NIP-13: Enforce proof of work when a minimum difficulty is required
+    min_pow = min_pow_difficulty
+    if min_pow > 0
+      pow = NostrRelay.pow_difficulty(event["id"])
+      if pow < min_pow
+        return [false, "pow: difficulty #{pow} is less than #{min_pow}"]
       end
     end
 
@@ -859,7 +897,7 @@ class RelayInfo
         icon: ENV['RELAY_ICON'] || "",
         relay_countries: (ENV['RELAY_COUNTRIES'] || "JP").split(',').map(&:strip).reject(&:empty?),
         # Updated supported_nips based on common implementations and NIPs handled
-        supported_nips: [1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 62, 66, 70, 78],
+        supported_nips: [1, 4, 9, 11, 13, 17, 26, 40, 42, 45, 50, 59, 62, 66, 70, 78],
         software: "https://github.com/mattn/ruby-nostr-relay",
         version: "1.0.0",
         limitation: {
@@ -872,7 +910,7 @@ class RelayInfo
           min_prefix: 4,
           max_event_tags: 2000,
           max_content_length: 65536,
-          min_pow_difficulty: 0, # Currently not enforced
+          min_pow_difficulty: NostrRelay::MIN_POW_DIFFICULTY,
           auth_required: false,  # Authentication is required only for restricted resources
           payment_required: false # Currently not implemented
         }

@@ -152,6 +152,27 @@ class NostrRelayAuthTest
       DB[:event].where(id: events.map { |ev| ev['id'] }).delete
     end
   end
+
+  def test_pow_difficulty_counts_leading_zero_bits
+    {
+      'ffff' => 0, '7fff' => 1, '3fff' => 2, '1fff' => 3, '0fff' => 4,
+      '00ff' => 8, '002f' => 10, '0001' => 15, '000000000e9d897a3aa5f' => 36,
+      '0' * 64 => 256, '' => 0, '00zz' => 8
+    }.each do |id, bits|
+      assert NostrRelay.pow_difficulty(id) == bits, "pow_difficulty(#{id}) should be #{bits}"
+    end
+  end
+
+  def test_rejects_events_below_min_pow_difficulty
+    relay = VerifiedRelay.new
+    relay.define_singleton_method(:min_pow_difficulty) { 8 }
+    event = @event.merge('id' => '01' + 'f' * 62, 'kind' => 1, 'tags' => [])
+
+    success, message = relay.send(:handle_event, event)
+
+    refute success
+    assert message == 'pow: difficulty 7 is less than 8', message
+  end
 end
 
 NostrRelayAuthTest.instance_methods(false).grep(/^test_/).each do |test|
