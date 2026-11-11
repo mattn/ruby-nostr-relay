@@ -12,6 +12,7 @@ This relay supports the following Nostr Implementation Possibilities (NIPs):
 - **NIP-09**: Event deletion (kind 5)
 - **NIP-11**: Relay Information Document
 - **NIP-12**: Generic tag queries (#e, #p, etc)
+- **NIP-13**: Proof of Work (minimum difficulty set by `MIN_POW_DIFFICULTY`, default 0)
 - **NIP-15**: Marketplace
 - **NIP-16**: Event Treatment (ephemeral events 20000-29999)
 - **NIP-20**: Command results (OK messages)
